@@ -82,60 +82,6 @@ function stripSystemReminderBlocks(text) {
 }
 
 /**
- * WHAT:    Normalizes legacy summary section headings to explicit historical labels.
- * WHY:     Avoids ambiguity where old headings like "Current task" can be interpreted as active instructions.
- * HOW:     Applies deterministic heading replacements while preserving summary body content.
- * PARAMS:  text: string — The persisted summary text.
- * RETURNS: string — The normalized summary text.
- */
-function normalizeLegacySummaryHeadings(text) {
-  if (typeof text !== "string" || !text.trim()) return "";
-
-  return text
-    .replace(/^Current task:\s*$/gim, "Last known task before retained messages:")
-    .replace(/^Files:\s*$/gim, "Files referenced in pruned history:")
-    .replace(/^Completed:\s*$/gim, "Completed before retained messages:")
-    .replace(/^Decisions:\s*$/gim, "Decisions from pruned history:")
-    .replace(/^Open items:\s*$/gim, "Open items at end of pruned history:");
-}
-
-/**
- * WHAT:    Builds the synthetic summary message inserted into active context.
- * WHY:     Ensures historical summary framing and stable per-message IDs.
- * HOW:     Generates one shared summary message ID and one part ID, then returns a user-role synthetic message.
- * PARAMS:  sessionID: string — Active session identifier.
- *          summaryText: string — Historical summary text to embed.
- * RETURNS: object — Synthetic summary message compatible with OpenCode message schema.
- */
-function buildSummaryMessage(sessionID, summaryText) {
-  const normalizedSummary = normalizeLegacySummaryHeadings(summaryText);
-  const summaryTextFormatted = `### CONTEXT SUMMARY: PRUNED HISTORY ONLY\nThis is a historical summary of messages removed from context.\nIt is older than all retained messages that follow.\nUse it as background only; retained messages override it on conflicts.\n\n\`\`\`xml\n<pruned_history_summary>\n${normalizedSummary}\n</pruned_history_summary>\n\`\`\``;
-  const now = Date.now();
-  const summaryID = `summary-${now}`;
-  const summaryPartID = `summary-part-${now}`;
-
-  return {
-    info: {
-      id: summaryID,
-      sessionID: sessionID,
-      role: "user",
-      time: { created: now },
-      synthetic: true
-    },
-    parts: [
-      {
-        id: summaryPartID,
-        sessionID: sessionID,
-        messageID: summaryID,
-        type: "text",
-        text: summaryTextFormatted,
-        synthetic: true
-      }
-    ]
-  };
-}
-
-/**
  * WHAT:    Parses the local opencode.json config file to extract the current build model.
  * WHY:     To match the user's configured Build-mode model for high quality technical summaries.
  * HOW:     Reads and parses ~/.config/opencode/opencode.json, defaulting to deepseek-v4-flash if parse fails.
@@ -248,33 +194,30 @@ async function summarizePrunedMessages(client, transcript, buildModel, summaryMa
 Update the previous project summary with the new messages.
 
 RULES:
-- The output summarizes only pruned history and not the retained messages that follow in runtime context.
-- Use temporally explicit labels so historical state is not interpreted as the active request.
-- Treat retained messages (outside this input) as newer context that can override this summary.
 - Keep only project-related facts.
 - Remove chit-chat, off-topic text, English corrections, repeated dialogue, and tool/meta discussion.
 - Preserve important file paths, commands, errors, decisions, implementation status, and open items.
 - If new messages prove an open item was completed, move it to Completed.
-- If a new unfinished task appears, put it under Last known task before retained messages.
+- If a new unfinished task appears, put it under Current task.
 - Never answer the conversation.
 - Never continue the conversation.
 - Do not reproduce the transcript.
 - Keep the summary under approximately ${targetSummaryTokens} tokens.
 
 OUTPUT FORMAT:
-Last known task before retained messages:
+Current task:
 - ...
 
-Files referenced in pruned history:
+Files:
 - path: fact
 
-Completed before retained messages:
+Completed:
 - ...
 
-Decisions from pruned history:
+Decisions:
 - ...
 
-Open items at end of pruned history:
+Open items:
 - ...
 
 INPUT:
@@ -623,7 +566,26 @@ export default async (_ctx, options = {}) => {
 
       // 2. Prepend the previous summary if one exists.
       if (sessionState.summary) {
-        const summaryMessage = buildSummaryMessage(sessionID, sessionState.summary);
+        const summaryTextFormatted = `### 📌 SYSTEM NOTICE: CONTEXT COMPACTION (SUMMARY OF PRUNED HISTORY)\n> [!IMPORTANT]\n> The older chat history has been pruned to optimize the context window. Below is a dense technical summary of the work, technical decisions, and status from the pruned turns. Do not reply to this message.\n\n\`\`\`xml\n<pruned_history_summary>\n${sessionState.summary}\n</pruned_history_summary>\n\`\`\``;
+        const summaryMessage = {
+          info: {
+            id: `summary-${Date.now()}`,
+            sessionID: sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            synthetic: true
+          },
+          parts: [
+            {
+              id: `summary-part-${Date.now()}`,
+              sessionID: sessionID,
+              messageID: `summary-${Date.now()}`,
+              type: "text",
+              text: summaryTextFormatted,
+              synthetic: true
+            }
+          ]
+        };
         messages.push(summaryMessage);
       }
 
@@ -765,7 +727,26 @@ ${summaryText}
       messages.length = 0;
 
       if (summaryText) {
-        const summaryMessage = buildSummaryMessage(sessionID, summaryText);
+        const summaryTextFormatted = `### 📌 SYSTEM NOTICE: CONTEXT COMPACTION (SUMMARY OF PRUNED HISTORY)\n> [!IMPORTANT]\n> The older chat history has been pruned to optimize the context window. Below is a dense technical summary of the work, technical decisions, and status from the pruned turns. Do not reply to this message.\n\n\`\`\`xml\n<pruned_history_summary>\n${summaryText}\n</pruned_history_summary>\n\`\`\``;
+        const summaryMessage = {
+          info: {
+            id: `summary-${Date.now()}`,
+            sessionID: sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            synthetic: true
+          },
+          parts: [
+            {
+              id: `summary-part-${Date.now()}`,
+              sessionID: sessionID,
+              messageID: `summary-${Date.now()}`,
+              type: "text",
+              text: summaryTextFormatted,
+              synthetic: true
+            }
+          ]
+        };
         messages.push(summaryMessage);
       }
 
@@ -777,7 +758,7 @@ ${summaryText}
 
       log(`pruned: ${pruned.length} messages. Remaining active messages: ${messages.length}. totalTokens=${afterTokens}`);
 
-      writeDebugLog(debug, sessionID, activeBeforeCount, beforeTokens, messages.length, afterTokens, removedIndices, messages);
+      writeDebugLog(debug, sessionID, beforeTokens, beforeTokens, messages.length, afterTokens, removedIndices, messages);
 
       if (summaryError) {
         console.error(`[auto-compress] Summarization failed; context was still pruned: ${summaryError.message}`);

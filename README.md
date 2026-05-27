@@ -30,6 +30,7 @@ Add to `~/.config/opencode/opencode.json`:
     "maxContextLimit": 40000,
     "minContextLimit": 20000,
     "summaryMaxTokens": 6000,
+    "model": "openai/gpt-5.4-mini",
     "debug": false,
     "debugRequestPayload": false
   }
@@ -43,6 +44,7 @@ Add to `~/.config/opencode/opencode.json`:
 | `maxContextLimit`     | number  | `70000` | Compaction starts when estimated context tokens exceed this value       |
 | `minContextLimit`     | number  | `30000` | Pruning target for the remaining active context                         |
 | `summaryMaxTokens`    | number  | `1000`  | Approximate summary budget requested from summarizer                    |
+| `model`               | string  | active session model | Fixed summarizer model in `provider/model` format             |
 | `debug`               | boolean | `false` | Master file-debug switch; `false` disables log/debug file writes        |
 | `debugRequestPayload` | boolean | `false` | Logs summarization HTTP payload JSON; effective only when `debug: true` |
 
