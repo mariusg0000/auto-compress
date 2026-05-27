@@ -470,7 +470,7 @@ function sumTokens(msg, messageIndex = -1, keptReasoningSet = null) {
     const p = msg.parts[partIndex];
     if (p.type === "text") s += Math.ceil((p.text || "").length / MSG_TOK_COEF);
     else if (p.type === "reasoning") s += 0;
-    else if (p.type === "tool") s += Math.ceil(JSON.stringify(p.state || "").length / MSG_TOK_COEF);
+    else if (p.type === "tool") s += 0;
     else if (p.text) s += Math.ceil(p.text.length / MSG_TOK_COEF);
   }
   return s;
