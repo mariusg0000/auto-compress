@@ -15,8 +15,10 @@ import { homedir } from "os";
 const MSG_TOK_COEF = 3.5;
 const DEBUG_DIR = join(homedir(), ".config", "opencode", "logs", "auto-compress");
 const LOG_FILE = join(DEBUG_DIR, "auto-compress.log");
+const TOKEN_LOG_FILE = join(DEBUG_DIR, "token-calc.log");
 let fetchDebugInstalled = false;
 let debugEnabled = false;
+let tokenCalcDebugEnabled = false;
 
 function installRequestPayloadDebug(enabled) {
   if (!enabled || fetchDebugInstalled || typeof globalThis.fetch !== "function") return;
@@ -76,63 +78,25 @@ function log(msg) {
   } catch {}
 }
 
+/**
+ * WHAT:    Appends token-calculation trace lines to a dedicated debug file.
+ * WHY:     Allows auditing exact inputs and per-part values used by token estimator.
+ * HOW:     Writes timestamped line into TOKEN_LOG_FILE when token calc debug is enabled.
+ * PARAMS:  msg: string — Trace line to persist.
+ * RETURNS: void
+ */
+function logTokenCalc(msg) {
+  if (!tokenCalcDebugEnabled) return;
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  try {
+    ensureDir();
+    appendFileSync(TOKEN_LOG_FILE, line, "utf-8");
+  } catch {}
+}
+
 function stripSystemReminderBlocks(text) {
   if (typeof text !== "string" || !text) return "";
   return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
-}
-
-/**
- * WHAT:    Builds the set of reasoning part coordinates that must be preserved.
- * WHY:     Keeps token estimation and effective stripping behavior aligned with preserve-last policy.
- * HOW:     Walks messages from newest to oldest and marks up to preserveLast reasoning parts.
- * PARAMS:  messages: Array<object> — Active messages currently in transform pipeline.
- *          preserveLast: number — Number of newest reasoning parts to preserve.
- * RETURNS: Set<string> — Coordinates encoded as "messageIndex:partIndex".
- */
-function buildKeptReasoningSet(messages, preserveLast) {
-  const keepCount = Number.isFinite(Number(preserveLast)) ? Math.max(0, Math.floor(Number(preserveLast))) : 0;
-  const kept = new Set();
-  if (keepCount <= 0) return kept;
-
-  for (let mi = messages.length - 1; mi >= 0 && kept.size < keepCount; mi--) {
-    const parts = Array.isArray(messages[mi]?.parts) ? messages[mi].parts : [];
-    for (let pi = parts.length - 1; pi >= 0 && kept.size < keepCount; pi--) {
-      if (parts[pi]?.type === "reasoning") {
-        kept.add(`${mi}:${pi}`);
-      }
-    }
-  }
-
-  return kept;
-}
-
-/**
- * WHAT:    Removes reasoning parts from output messages except the preserve-last subset.
- * WHY:     Reduces context footprint right before provider payload generation without changing persisted DB state.
- * HOW:     Rewrites non-preserved reasoning parts to empty text parts in-place and reports totals.
- * PARAMS:  messages: Array<object> — Messages to mutate in-memory.
- *          keptReasoningSet: Set<string> — Coordinates of reasoning parts to keep.
- * RETURNS: { stripped: number, chars: number } — Removal counters used for debug logs.
- */
-function applyReasoningStrip(messages, keptReasoningSet) {
-  let stripped = 0;
-  let chars = 0;
-
-  for (let mi = 0; mi < messages.length; mi++) {
-    const msg = messages[mi];
-    const parts = Array.isArray(msg?.parts) ? msg.parts : [];
-    msg.parts = parts
-      .map((part, pi) => {
-        if (!part || part.type !== "reasoning") return part;
-        if (keptReasoningSet.has(`${mi}:${pi}`)) return part;
-        stripped++;
-        chars += (part.text || "").length;
-        return { type: "text", text: "" };
-      })
-      .filter(Boolean);
-  }
-
-  return { stripped, chars };
 }
 
 /**
@@ -464,15 +428,42 @@ ${transcript}`;
  * PARAMS:  msg: object — The message structure with parts.
  * RETURNS: number — Estimated token count.
  */
-function sumTokens(msg, messageIndex = -1, keptReasoningSet = null) {
+function sumTokens(msg, messageIndex = -1) {
   let s = 0;
+  const messageID = msg?.info?.id || "unknown";
+  const role = msg?.info?.role || "unknown";
+  logTokenCalc(`[message:start] index=${messageIndex} id=${messageID} role=${role}`);
   for (let partIndex = 0; partIndex < msg.parts.length; partIndex++) {
     const p = msg.parts[partIndex];
-    if (p.type === "text") s += Math.ceil((p.text || "").length / MSG_TOK_COEF);
-    else if (p.type === "reasoning") s += 0;
-    else if (p.type === "tool") s += 0;
-    else if (p.text) s += Math.ceil(p.text.length / MSG_TOK_COEF);
+    if (p.type === "text") {
+      const chars = (p.text || "").length;
+      const tokens = Math.ceil(chars / MSG_TOK_COEF);
+      s += tokens;
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=text chars=${chars} tokens=${tokens}`);
+    }
+    else if (p.type === "reasoning") {
+      const chars = (p.text || "").length;
+      const tokens = Math.ceil(chars / MSG_TOK_COEF);
+      s += tokens;
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=reasoning chars=${chars} tokens=${tokens}`);
+    }
+    else if (p.type === "tool") {
+      const serialized = JSON.stringify(p.state || "");
+      const chars = serialized.length;
+      const tokens = Math.ceil(chars / MSG_TOK_COEF);
+      s += tokens;
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=tool chars=${chars} tokens=${tokens} source=JSON.stringify(part.state)`);
+    }
+    else if (p.text) {
+      const chars = p.text.length;
+      const tokens = Math.ceil(chars / MSG_TOK_COEF);
+      s += tokens;
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=${p.type || "unknown"} chars=${chars} tokens=${tokens} source=part.text`);
+    } else {
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=${p.type || "unknown"} chars=0 tokens=0 reason=no-text`);
+    }
   }
+  logTokenCalc(`[message:end] index=${messageIndex} id=${messageID} role=${role} totalTokens=${s}`);
   return s;
 }
 
@@ -629,17 +620,16 @@ function cleanupOldStateFiles(maxAgeDays = 30) {
  * RETURNS: Promise<object> — Object representing hooks.
  */
 export default async (_ctx, options = {}) => {
-  const maxLimit = options.maxContextLimit ?? 70000;
-  const minLimit = options.minContextLimit ?? 30000;
   const summaryMaxTokens = options.summaryMaxTokens ?? 1000;
   const configuredSummaryModel = options.model;
   const debug = options.debug ?? false;
   const debugRequestPayload = options.debugRequestPayload ?? false;
-  const stripReasoning = options.stripReasoning ?? false;
-  const preserveReasoningLast = options.preserveReasoningLast ?? 1;
-  const stripReasoningVerbosity = options.stripReasoningVerbosity ?? true;
+  const maxMessages = options.maxContextMessages ?? 80;
+  const minMessages = options.minContextMessages ?? 50;
+  const debugTokenCalc = options.debugTokenCalc ?? false;
 
   debugEnabled = Boolean(debug);
+  tokenCalcDebugEnabled = Boolean(debug) && Boolean(debugTokenCalc);
 
   if (debugEnabled) {
     log("MODULE LOADED");
@@ -648,7 +638,7 @@ export default async (_ctx, options = {}) => {
   installRequestPayloadDebug(debugEnabled && debugRequestPayload);
   cleanupOldStateFiles(30);
 
-  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxLimit=${maxLimit}, minLimit=${minLimit}, summaryMaxTokens=${summaryMaxTokens}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, stripReasoning=${stripReasoning}, preserveReasoningLast=${preserveReasoningLast}, stripReasoningVerbosity=${stripReasoningVerbosity}`);
+  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextMessages=${maxMessages}, minContextMessages=${minMessages}, summaryMaxTokens=${summaryMaxTokens}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}`);
 
   return {
     "experimental.chat.messages.transform": async (_input, output) => {
@@ -688,19 +678,17 @@ export default async (_ctx, options = {}) => {
       // Add the remaining active messages.
       messages.push(...filteredMessages);
 
-      const keptReasoningSet = stripReasoning ? buildKeptReasoningSet(messages, preserveReasoningLast) : null;
-      const totalTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex, keptReasoningSet), 0);
-      log(`[hook] Reconstructed messages=${messages.length}, totalTokens=${totalTokens}, maxLimit=${maxLimit}, minLimit=${minLimit}`);
+      if (tokenCalcDebugEnabled) {
+        logTokenCalc("================================================================================");
+        logTokenCalc(`[transform:start] sessionID=${sessionID} messages=${messages.length}`);
+      }
+      const activeCount = messages.filter((m) => !m.info?.synthetic).length;
+      const totalTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
+      log(`[hook] Reconstructed messages=${messages.length}, activeMessages=${activeCount}, maxContextMessages=${maxMessages}, minContextMessages=${minMessages}, estimatedTokens=${totalTokens}`);
+      logTokenCalc(`[transform:reconstructed] activeMessages=${activeCount} maxContextMessages=${maxMessages} minContextMessages=${minMessages} estimatedTokens=${totalTokens}`);
       
-      if (totalTokens < maxLimit) {
-        if (stripReasoning) {
-          const stripStats = applyReasoningStrip(messages, keptReasoningSet);
-          if (stripReasoningVerbosity && stripStats.stripped > 0) {
-            const approxTokens = Math.round(stripStats.chars / MSG_TOK_COEF);
-            log(`[reasoning] stripped=${stripStats.stripped}, chars=${stripStats.chars}, approxTokens=${approxTokens}, preserveLast=${preserveReasoningLast}`);
-          }
-        }
-        log("[hook] Below maxLimit, returning reconstructed context.");
+      if (activeCount < maxMessages) {
+        log("[hook] Below maxContextMessages, returning reconstructed context.");
         return output;
       }
 
@@ -726,7 +714,7 @@ export default async (_ctx, options = {}) => {
       const startIndex = (messages[0]?.info?.synthetic) ? 1 : 0;
 
       for (let i = startIndex; i < messages.length; i++) {
-        const msgTok = sumTokens(messages[i], i, keptReasoningSet);
+        const msgTok = sumTokens(messages[i], i);
         accumulated += msgTok;
 
         for (const p of messages[i].parts) {
@@ -735,8 +723,8 @@ export default async (_ctx, options = {}) => {
           }
         }
 
-        const remaining = totalTokens - accumulated;
-        if (remaining <= minLimit) {
+        const remainingMessages = messages.length - (i + 1);
+        if (remainingMessages <= minMessages) {
           cutIndex = i + 1;
           break;
         }
@@ -837,20 +825,12 @@ ${summaryText}
 
       messages.push(...kept);
 
-      const finalKeptReasoningSet = stripReasoning ? buildKeptReasoningSet(messages, preserveReasoningLast) : null;
-      if (stripReasoning) {
-        const stripStats = applyReasoningStrip(messages, finalKeptReasoningSet);
-        if (stripReasoningVerbosity && stripStats.stripped > 0) {
-          const approxTokens = Math.round(stripStats.chars / MSG_TOK_COEF);
-          log(`[reasoning] stripped=${stripStats.stripped}, chars=${stripStats.chars}, approxTokens=${approxTokens}, preserveLast=${preserveReasoningLast}`);
-        }
-      }
-
-      const afterTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex, finalKeptReasoningSet), 0);
+      const afterTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
       const removedIndices = [];
       for (let i = startIndex; i < cutIndex; i++) removedIndices.push(i);
 
       log(`pruned: ${pruned.length} messages. Remaining active messages: ${messages.length}. totalTokens=${afterTokens}`);
+      logTokenCalc(`[transform:final] pruned=${pruned.length} remainingMessages=${messages.length} totalTokens=${afterTokens}`);
 
       writeDebugLog(debug, sessionID, activeBeforeCount, beforeTokens, messages.length, afterTokens, removedIndices, messages);
 
