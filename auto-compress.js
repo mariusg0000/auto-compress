@@ -82,6 +82,60 @@ function stripSystemReminderBlocks(text) {
 }
 
 /**
+ * WHAT:    Builds the set of reasoning part coordinates that must be preserved.
+ * WHY:     Keeps token estimation and effective stripping behavior aligned with preserve-last policy.
+ * HOW:     Walks messages from newest to oldest and marks up to preserveLast reasoning parts.
+ * PARAMS:  messages: Array<object> — Active messages currently in transform pipeline.
+ *          preserveLast: number — Number of newest reasoning parts to preserve.
+ * RETURNS: Set<string> — Coordinates encoded as "messageIndex:partIndex".
+ */
+function buildKeptReasoningSet(messages, preserveLast) {
+  const keepCount = Number.isFinite(Number(preserveLast)) ? Math.max(0, Math.floor(Number(preserveLast))) : 0;
+  const kept = new Set();
+  if (keepCount <= 0) return kept;
+
+  for (let mi = messages.length - 1; mi >= 0 && kept.size < keepCount; mi--) {
+    const parts = Array.isArray(messages[mi]?.parts) ? messages[mi].parts : [];
+    for (let pi = parts.length - 1; pi >= 0 && kept.size < keepCount; pi--) {
+      if (parts[pi]?.type === "reasoning") {
+        kept.add(`${mi}:${pi}`);
+      }
+    }
+  }
+
+  return kept;
+}
+
+/**
+ * WHAT:    Removes reasoning parts from output messages except the preserve-last subset.
+ * WHY:     Reduces context footprint right before provider payload generation without changing persisted DB state.
+ * HOW:     Rewrites non-preserved reasoning parts to empty text parts in-place and reports totals.
+ * PARAMS:  messages: Array<object> — Messages to mutate in-memory.
+ *          keptReasoningSet: Set<string> — Coordinates of reasoning parts to keep.
+ * RETURNS: { stripped: number, chars: number } — Removal counters used for debug logs.
+ */
+function applyReasoningStrip(messages, keptReasoningSet) {
+  let stripped = 0;
+  let chars = 0;
+
+  for (let mi = 0; mi < messages.length; mi++) {
+    const msg = messages[mi];
+    const parts = Array.isArray(msg?.parts) ? msg.parts : [];
+    msg.parts = parts
+      .map((part, pi) => {
+        if (!part || part.type !== "reasoning") return part;
+        if (keptReasoningSet.has(`${mi}:${pi}`)) return part;
+        stripped++;
+        chars += (part.text || "").length;
+        return { type: "text", text: "" };
+      })
+      .filter(Boolean);
+  }
+
+  return { stripped, chars };
+}
+
+/**
  * WHAT:    Normalizes legacy summary section headings to explicit historical labels.
  * WHY:     Avoids ambiguity where old headings like "Current task" can be interpreted as active instructions.
  * HOW:     Applies deterministic heading replacements while preserving summary body content.
@@ -410,11 +464,19 @@ ${transcript}`;
  * PARAMS:  msg: object — The message structure with parts.
  * RETURNS: number — Estimated token count.
  */
-function sumTokens(msg) {
+function sumTokens(msg, messageIndex = -1, keptReasoningSet = null) {
   let s = 0;
-  for (const p of msg.parts) {
+  for (let partIndex = 0; partIndex < msg.parts.length; partIndex++) {
+    const p = msg.parts[partIndex];
     if (p.type === "text") s += Math.ceil((p.text || "").length / MSG_TOK_COEF);
-    else if (p.type === "reasoning") s += Math.ceil((p.text || "").length / MSG_TOK_COEF);
+    else if (p.type === "reasoning") {
+      const keepReasoning = keptReasoningSet instanceof Set
+        ? keptReasoningSet.has(`${messageIndex}:${partIndex}`)
+        : true;
+      if (keepReasoning) {
+        s += Math.ceil((p.text || "").length / MSG_TOK_COEF);
+      }
+    }
     else if (p.type === "tool") s += Math.ceil(JSON.stringify(p.state || "").length / MSG_TOK_COEF);
     else if (p.text) s += Math.ceil(p.text.length / MSG_TOK_COEF);
   }
@@ -580,6 +642,9 @@ export default async (_ctx, options = {}) => {
   const configuredSummaryModel = options.model;
   const debug = options.debug ?? false;
   const debugRequestPayload = options.debugRequestPayload ?? false;
+  const stripReasoning = options.stripReasoning ?? false;
+  const preserveReasoningLast = options.preserveReasoningLast ?? 1;
+  const stripReasoningVerbosity = options.stripReasoningVerbosity ?? true;
 
   debugEnabled = Boolean(debug);
 
@@ -590,7 +655,7 @@ export default async (_ctx, options = {}) => {
   installRequestPayloadDebug(debugEnabled && debugRequestPayload);
   cleanupOldStateFiles(30);
 
-  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxLimit=${maxLimit}, minLimit=${minLimit}, summaryMaxTokens=${summaryMaxTokens}, debug=${debug}, debugRequestPayload=${debugRequestPayload}`);
+  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxLimit=${maxLimit}, minLimit=${minLimit}, summaryMaxTokens=${summaryMaxTokens}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, stripReasoning=${stripReasoning}, preserveReasoningLast=${preserveReasoningLast}, stripReasoningVerbosity=${stripReasoningVerbosity}`);
 
   return {
     "experimental.chat.messages.transform": async (_input, output) => {
@@ -630,10 +695,18 @@ export default async (_ctx, options = {}) => {
       // Add the remaining active messages.
       messages.push(...filteredMessages);
 
-      const totalTokens = messages.reduce((s, m) => s + sumTokens(m), 0);
+      const keptReasoningSet = stripReasoning ? buildKeptReasoningSet(messages, preserveReasoningLast) : null;
+      const totalTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex, keptReasoningSet), 0);
       log(`[hook] Reconstructed messages=${messages.length}, totalTokens=${totalTokens}, maxLimit=${maxLimit}, minLimit=${minLimit}`);
       
       if (totalTokens < maxLimit) {
+        if (stripReasoning) {
+          const stripStats = applyReasoningStrip(messages, keptReasoningSet);
+          if (stripReasoningVerbosity && stripStats.stripped > 0) {
+            const approxTokens = Math.round(stripStats.chars / MSG_TOK_COEF);
+            log(`[reasoning] stripped=${stripStats.stripped}, chars=${stripStats.chars}, approxTokens=${approxTokens}, preserveLast=${preserveReasoningLast}`);
+          }
+        }
         log("[hook] Below maxLimit, returning reconstructed context.");
         return output;
       }
@@ -660,7 +733,7 @@ export default async (_ctx, options = {}) => {
       const startIndex = (messages[0]?.info?.synthetic) ? 1 : 0;
 
       for (let i = startIndex; i < messages.length; i++) {
-        const msgTok = sumTokens(messages[i]);
+        const msgTok = sumTokens(messages[i], i, keptReasoningSet);
         accumulated += msgTok;
 
         for (const p of messages[i].parts) {
@@ -771,7 +844,16 @@ ${summaryText}
 
       messages.push(...kept);
 
-      const afterTokens = messages.reduce((s, m) => s + sumTokens(m), 0);
+      const finalKeptReasoningSet = stripReasoning ? buildKeptReasoningSet(messages, preserveReasoningLast) : null;
+      if (stripReasoning) {
+        const stripStats = applyReasoningStrip(messages, finalKeptReasoningSet);
+        if (stripReasoningVerbosity && stripStats.stripped > 0) {
+          const approxTokens = Math.round(stripStats.chars / MSG_TOK_COEF);
+          log(`[reasoning] stripped=${stripStats.stripped}, chars=${stripStats.chars}, approxTokens=${approxTokens}, preserveLast=${preserveReasoningLast}`);
+        }
+      }
+
+      const afterTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex, finalKeptReasoningSet), 0);
       const removedIndices = [];
       for (let i = startIndex; i < cutIndex; i++) removedIndices.push(i);
 

@@ -31,6 +31,9 @@ Add to `~/.config/opencode/opencode.json`:
     "minContextLimit": 20000,
     "summaryMaxTokens": 6000,
     "model": "openai/gpt-5.4-mini",
+    "stripReasoning": true,
+    "preserveReasoningLast": 1,
+    "stripReasoningVerbosity": true,
     "debug": false,
     "debugRequestPayload": false
   }
@@ -45,6 +48,9 @@ Add to `~/.config/opencode/opencode.json`:
 | `minContextLimit`     | number  | `30000` | Pruning target for the remaining active context                         |
 | `summaryMaxTokens`    | number  | `1000`  | Approximate summary budget requested from summarizer                    |
 | `model`               | string  | active session model | Fixed summarizer model in `provider/model` format             |
+| `stripReasoning`      | boolean | `false` | Enables request-time reasoning stripping inside this plugin             |
+| `preserveReasoningLast` | number | `1`    | Keeps only the newest N reasoning parts; strips older reasoning parts   |
+| `stripReasoningVerbosity` | boolean | `true` | Emits strip counters in plugin log when reasoning is removed         |
 | `debug`               | boolean | `false` | Master file-debug switch; `false` disables log/debug file writes        |
 | `debugRequestPayload` | boolean | `false` | Logs summarization HTTP payload JSON; effective only when `debug: true` |
 
@@ -88,23 +94,24 @@ Cons:
 ### OpenCode Hook Position
 
 - Runs in plugin order from `opencode.json`.
-- Recommended order when paired with `strip-reasoning`: run `strip-reasoning` first, then `auto-compress`.
+- When `stripReasoning: true`, this plugin performs strip-aware token estimation and effective request-time stripping by itself.
 
 ### Runtime Flow
 
 1. Load state from `~/.config/opencode/logs/auto-compress/state/<sessionID>.json`.
 2. Reconstruct message list by removing already summarized IDs and old synthetic summary marker.
-3. Estimate tokens (`MSG_TOK_COEF = 3.5`) across text/reasoning/tool parts.
-4. If under `maxContextLimit`, return reconstructed messages unchanged.
-5. If over limit, compute prune cut toward `minContextLimit`.
-6. Extend cut when needed to avoid splitting tool-use/result semantics.
-7. Build transcript from pruned messages:
+3. Optionally build preserve-last reasoning mask (`preserveReasoningLast`) for strip-aware accounting.
+4. Estimate tokens (`MSG_TOK_COEF = 3.5`) with the same reasoning visibility that will be sent to provider.
+5. If under `maxContextLimit`, optionally strip reasoning in-memory and return reconstructed messages.
+6. If over limit, compute prune cut toward `minContextLimit`.
+7. Extend cut when needed to avoid splitting tool-use/result semantics.
+8. Build transcript from pruned messages:
    - include text parts only,
    - remove `<system-reminder>...</system-reminder>` blocks,
    - skip empty lines/messages.
-8. Summarize using temporary session and `promptAsync` with `agent: "compaction"`.
-9. Merge summary into rolling state and save updated `summarizedIDs`.
-10. Return final message list with summary banner prepended.
+9. Summarize using temporary session and `promptAsync` with `agent: "compaction"`.
+10. Merge summary into rolling state and save updated `summarizedIDs`.
+11. Optionally strip reasoning in-memory on final output and return message list with summary banner prepended.
 
 ### State And Files
 
