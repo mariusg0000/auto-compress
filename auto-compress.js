@@ -469,14 +469,7 @@ function sumTokens(msg, messageIndex = -1, keptReasoningSet = null) {
   for (let partIndex = 0; partIndex < msg.parts.length; partIndex++) {
     const p = msg.parts[partIndex];
     if (p.type === "text") s += Math.ceil((p.text || "").length / MSG_TOK_COEF);
-    else if (p.type === "reasoning") {
-      const keepReasoning = keptReasoningSet instanceof Set
-        ? keptReasoningSet.has(`${messageIndex}:${partIndex}`)
-        : true;
-      if (keepReasoning) {
-        s += Math.ceil((p.text || "").length / MSG_TOK_COEF);
-      }
-    }
+    else if (p.type === "reasoning") s += 0;
     else if (p.type === "tool") s += Math.ceil(JSON.stringify(p.state || "").length / MSG_TOK_COEF);
     else if (p.text) s += Math.ceil(p.text.length / MSG_TOK_COEF);
   }
