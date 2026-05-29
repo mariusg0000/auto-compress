@@ -529,7 +529,7 @@ function ensureStateDir() {
  * WHY:     To retrieve the rolling summary and the list of already compacted message IDs.
  * HOW:     Reads the JSON state file from STATE_DIR. Returns empty state if file doesn't exist or is invalid.
  * PARAMS:  sessionID: string — The active conversation session ID.
- * RETURNS: object — The loaded state containing { summary: string, summarizedIDs: Array<string> }.
+ * RETURNS: object — The loaded state containing { summary: string, summarizedIDs: Array<string>, summaryFailureCount: number }.
  */
 function loadSessionState(sessionID) {
   ensureStateDir();
@@ -540,14 +540,17 @@ function loadSessionState(sessionID) {
       if (data && typeof data === "object") {
         return {
           summary: data.summary || "",
-          summarizedIDs: Array.isArray(data.summarizedIDs) ? data.summarizedIDs : []
+          summarizedIDs: Array.isArray(data.summarizedIDs) ? data.summarizedIDs : [],
+          summaryFailureCount: Number.isFinite(Number(data.summaryFailureCount))
+            ? Math.max(0, Math.floor(Number(data.summaryFailureCount)))
+            : 0,
         };
       }
     } catch (e) {
       log(`[state] Failed to load session state for ${sessionID}: ${e.message}`);
     }
   }
-  return { summary: "", summarizedIDs: [] };
+  return { summary: "", summarizedIDs: [], summaryFailureCount: 0 };
 }
 
 /**
@@ -557,14 +560,31 @@ function loadSessionState(sessionID) {
  * PARAMS:  sessionID: string — The active conversation session ID.
  *          summary: string — The updated rolling summary.
  *          summarizedIDs: Array<string> — The full list of compacted message IDs.
+ *          summaryFailureCount: number — Count of consecutive summarization failures for adaptive backoff.
  * RETURNS: void
  */
-function saveSessionState(sessionID, summary, summarizedIDs) {
+function saveSessionState(sessionID, summary, summarizedIDs, summaryFailureCount = 0) {
   ensureStateDir();
   const filePath = join(STATE_DIR, `${sessionID}.json`);
   try {
-    writeFileSync(filePath, JSON.stringify({ summary, summarizedIDs }, null, 2), "utf-8");
-    log(`[state] Saved session state for ${sessionID} with ${summarizedIDs.length} messages.`);
+    writeFileSync(
+      filePath,
+      JSON.stringify(
+        {
+          summary,
+          summarizedIDs,
+          summaryFailureCount: Number.isFinite(Number(summaryFailureCount))
+            ? Math.max(0, Math.floor(Number(summaryFailureCount)))
+            : 0,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    log(
+      `[state] Saved session state for ${sessionID} with ${summarizedIDs.length} messages and summaryFailureCount=${summaryFailureCount}.`,
+    );
   } catch (e) {
     log(`[state] Failed to save session state for ${sessionID}: ${e.message}`);
   }
@@ -626,6 +646,8 @@ export default async (_ctx, options = {}) => {
   const debugRequestPayload = options.debugRequestPayload ?? false;
   const maxMessages = options.maxContextMessages ?? 80;
   const minMessages = options.minContextMessages ?? 50;
+  const failureBackoffStepMessages = options.failureBackoffStepMessages ?? 10;
+  const failureBackoffMaxOffsetMessages = options.failureBackoffMaxOffsetMessages ?? 50;
   const debugTokenCalc = options.debugTokenCalc ?? false;
 
   debugEnabled = Boolean(debug);
@@ -638,7 +660,7 @@ export default async (_ctx, options = {}) => {
   installRequestPayloadDebug(debugEnabled && debugRequestPayload);
   cleanupOldStateFiles(30);
 
-  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextMessages=${maxMessages}, minContextMessages=${minMessages}, summaryMaxTokens=${summaryMaxTokens}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}`);
+  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextMessages=${maxMessages}, minContextMessages=${minMessages}, summaryMaxTokens=${summaryMaxTokens}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}, failureBackoffStepMessages=${failureBackoffStepMessages}, failureBackoffMaxOffsetMessages=${failureBackoffMaxOffsetMessages}`);
 
   return {
     "experimental.chat.messages.transform": async (_input, output) => {
@@ -652,7 +674,21 @@ export default async (_ctx, options = {}) => {
 
       const sessionID = messages.find((m) => m.info?.sessionID)?.info?.sessionID || "unknown";
       const sessionState = loadSessionState(sessionID);
-      log(`[hook] Loaded state for session ${sessionID}. Summarized count: ${sessionState.summarizedIDs.length}`);
+      log(`[hook] Loaded state for session ${sessionID}. Summarized count: ${sessionState.summarizedIDs.length}, summaryFailureCount=${sessionState.summaryFailureCount}`);
+
+      const sanitizedBackoffStep = Number.isFinite(Number(failureBackoffStepMessages))
+        ? Math.max(0, Math.floor(Number(failureBackoffStepMessages)))
+        : 10;
+      const sanitizedBackoffMaxOffset = Number.isFinite(Number(failureBackoffMaxOffsetMessages))
+        ? Math.max(0, Math.floor(Number(failureBackoffMaxOffsetMessages)))
+        : 50;
+      const failureCount = Number.isFinite(Number(sessionState.summaryFailureCount))
+        ? Math.max(0, Math.floor(Number(sessionState.summaryFailureCount)))
+        : 0;
+      const currentBackoffOffset = Math.min(failureCount * sanitizedBackoffStep, sanitizedBackoffMaxOffset);
+      const effectiveMaxMessages = maxMessages + currentBackoffOffset;
+      const hardMaxMessages = maxMessages + sanitizedBackoffMaxOffset;
+      const hardMinMessages = minMessages + sanitizedBackoffMaxOffset;
 
       // 1. Filter out already-summarized messages and synthetic summary messages.
       const summarizedSet = new Set(sessionState.summarizedIDs);
@@ -684,11 +720,11 @@ export default async (_ctx, options = {}) => {
       }
       const activeCount = messages.filter((m) => !m.info?.synthetic).length;
       const totalTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
-      log(`[hook] Reconstructed messages=${messages.length}, activeMessages=${activeCount}, maxContextMessages=${maxMessages}, minContextMessages=${minMessages}, estimatedTokens=${totalTokens}`);
-      logTokenCalc(`[transform:reconstructed] activeMessages=${activeCount} maxContextMessages=${maxMessages} minContextMessages=${minMessages} estimatedTokens=${totalTokens}`);
+      log(`[hook] Reconstructed messages=${messages.length}, activeMessages=${activeCount}, maxContextMessages=${maxMessages}, effectiveMaxMessages=${effectiveMaxMessages}, hardMaxMessages=${hardMaxMessages}, minContextMessages=${minMessages}, hardMinMessages=${hardMinMessages}, summaryFailureCount=${failureCount}, currentBackoffOffset=${currentBackoffOffset}, estimatedTokens=${totalTokens}`);
+      logTokenCalc(`[transform:reconstructed] activeMessages=${activeCount} maxContextMessages=${maxMessages} effectiveMaxMessages=${effectiveMaxMessages} hardMaxMessages=${hardMaxMessages} minContextMessages=${minMessages} hardMinMessages=${hardMinMessages} summaryFailureCount=${failureCount} currentBackoffOffset=${currentBackoffOffset} estimatedTokens=${totalTokens}`);
       
-      if (activeCount < maxMessages) {
-        log("[hook] Below maxContextMessages, returning reconstructed context.");
+      if (activeCount < effectiveMaxMessages) {
+        log("[hook] Below effectiveMaxMessages, returning reconstructed context.");
         return output;
       }
 
@@ -713,6 +749,9 @@ export default async (_ctx, options = {}) => {
       // Start evaluation from index 1 if index 0 is the synthetic summary message.
       const startIndex = (messages[0]?.info?.synthetic) ? 1 : 0;
 
+      const isHardLimitExceeded = activeCount > hardMaxMessages;
+      const targetRetainedMessages = isHardLimitExceeded ? hardMinMessages : minMessages;
+
       for (let i = startIndex; i < messages.length; i++) {
         const msgTok = sumTokens(messages[i], i);
         accumulated += msgTok;
@@ -724,7 +763,7 @@ export default async (_ctx, options = {}) => {
         }
 
         const remainingMessages = messages.length - (i + 1);
-        if (remainingMessages <= minMessages) {
+        if (remainingMessages <= targetRetainedMessages) {
           cutIndex = i + 1;
           break;
         }
@@ -750,6 +789,7 @@ export default async (_ctx, options = {}) => {
 
       let summaryText = sessionState.summary;
       let summaryError = null;
+      let nextFailureCount = failureCount;
       if (pruned.length > 0) {
         const newTranscriptLines = [];
         for (const m of pruned) {
@@ -790,6 +830,7 @@ ${newTranscript}`;
           if (!summaryText || !summaryText.trim()) {
             throw new Error("Empty summary text returned.");
           }
+          nextFailureCount = 0;
           log(`
 ======================================================================
 [COMPACTARE CONTEXT] TRANSCRIERE MESAJE ELIMINATE:
@@ -807,11 +848,25 @@ ${summaryText}
             .filter((id) => id);
 
           const updatedSummarizedIDs = [...sessionState.summarizedIDs, ...newlySummarizedIDs];
-          saveSessionState(sessionID, summaryText, updatedSummarizedIDs);
+          saveSessionState(sessionID, summaryText, updatedSummarizedIDs, nextFailureCount);
 
         } catch (err) {
           summaryError = err;
-          log(`Summarization execution failed: ${err.message}. Continuing context compaction without updated summary.`);
+          nextFailureCount = failureCount + 1;
+
+          if (!isHardLimitExceeded) {
+            log(`Summarization execution failed: ${err.message}. Hard limit not exceeded (activeCount=${activeCount}, hardMaxMessages=${hardMaxMessages}); skipping prune and increasing summaryFailureCount to ${nextFailureCount}.`);
+            saveSessionState(sessionID, sessionState.summary, sessionState.summarizedIDs, nextFailureCount);
+            return output;
+          }
+
+          log(`Summarization execution failed: ${err.message}. Hard limit exceeded (activeCount=${activeCount}, hardMaxMessages=${hardMaxMessages}); forcing prune to hardMinMessages=${hardMinMessages} and increasing summaryFailureCount to ${nextFailureCount}.`);
+
+          const newlySummarizedIDs = pruned
+            .map((m) => m.info?.id)
+            .filter((id) => id);
+          const updatedSummarizedIDs = [...sessionState.summarizedIDs, ...newlySummarizedIDs];
+          saveSessionState(sessionID, sessionState.summary, updatedSummarizedIDs, nextFailureCount);
         }
       }
 
