@@ -12,13 +12,18 @@ import { writeFileSync, mkdirSync, existsSync, appendFileSync, readFileSync, rea
 import { join } from "path";
 import { homedir } from "os";
 
-const MSG_TOK_COEF = 3.5;
+const DEFAULT_TOKEN_COEFFICIENT = 3.5;
+const DEFAULT_MAX_CONTEXT_TOKENS = 40000;
+const DEFAULT_MIN_CONTEXT_TOKENS = 20000;
+const DEFAULT_FAILURE_BACKOFF_STEP_TOKENS = 5000;
+const DEFAULT_FAILURE_BACKOFF_MAX_OFFSET_TOKENS = 25000;
 const DEBUG_DIR = join(homedir(), ".config", "opencode", "logs", "auto-compress");
 const LOG_FILE = join(DEBUG_DIR, "auto-compress.log");
 const TOKEN_LOG_FILE = join(DEBUG_DIR, "token-calc.log");
 let fetchDebugInstalled = false;
 let debugEnabled = false;
 let tokenCalcDebugEnabled = false;
+let tokenCoefficient = DEFAULT_TOKEN_COEFFICIENT;
 
 function installRequestPayloadDebug(enabled) {
   if (!enabled || fetchDebugInstalled || typeof globalThis.fetch !== "function") return;
@@ -85,9 +90,9 @@ function log(msg) {
  * PARAMS:  msg: string — Trace line to persist.
  * RETURNS: void
  */
-function logTokenCalc(msg) {
+function logTokenCalc(_msg) {
   if (!tokenCalcDebugEnabled) return;
-  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  const line = `[${new Date().toISOString()}] ${_msg}\n`;
   try {
     ensureDir();
     appendFileSync(TOKEN_LOG_FILE, line, "utf-8");
@@ -97,6 +102,168 @@ function logTokenCalc(msg) {
 function stripSystemReminderBlocks(text) {
   if (typeof text !== "string" || !text) return "";
   return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
+}
+
+function sanitizeToolText(text) {
+  if (typeof text !== "string" || !text) return "";
+  return stripSystemReminderBlocks(text).trim();
+}
+
+function stringifyToolInput(input, raw) {
+  if (typeof raw === "string" && raw.trim()) {
+    return sanitizeToolText(raw);
+  }
+  if (input === undefined) return "";
+  try {
+    const serialized = JSON.stringify(input, null, 2);
+    return sanitizeToolText(serialized);
+  } catch {
+    return "";
+  }
+}
+
+function buildToolTranscriptText(part) {
+  if (!part || part.type !== "tool") return "";
+  const toolName = typeof part.tool === "string" ? part.tool.trim() : "tool";
+  const status = part.state?.status;
+  const fragments = [`TOOL ${toolName}`];
+  const input = stringifyToolInput(part.state?.input, part.state?.raw);
+
+  if (input) fragments.push(`INPUT:\n${input}`);
+
+  if (status === "completed") {
+    const title = sanitizeToolText(part.state?.title);
+    const output = sanitizeToolText(part.state?.output);
+    if (title) fragments.push(`TITLE: ${title}`);
+    if (output) fragments.push(`OUTPUT:\n${output}`);
+  } else if (status === "error") {
+    const error = sanitizeToolText(part.state?.error);
+    if (error) fragments.push(`ERROR: ${error}`);
+  } else if (status === "running") {
+    const title = sanitizeToolText(part.state?.title);
+    if (title) fragments.push(`STATUS: ${title}`);
+  }
+
+  return fragments.length > 1 ? fragments.join("\n") : "";
+}
+
+const TOKEN_SPLIT_RE = /(\s+|[^\s\w]|\d+|[A-Za-z0-9_]+|[\u00C0-\u024F\u1E00-\u1EFF]+)/g;
+
+function tokenizeText(text) {
+  if (typeof text !== "string" || !text) return 0;
+  let count = 0;
+  for (const match of text.matchAll(TOKEN_SPLIT_RE)) {
+    const token = match[0];
+    if (!token) continue;
+    if (/^\s+$/.test(token)) {
+      continue;
+    }
+    if (/^[^\s\w]$/.test(token)) {
+      count += 1;
+      continue;
+    }
+    if (/^\d+$/.test(token)) {
+      count += Math.max(1, Math.ceil(token.length / 3.5));
+      continue;
+    }
+    if (/^[\u00C0-\u024F\u1E00-\u1EFF]+$/.test(token)) {
+      count += Math.max(1, Math.ceil(token.length / tokenCoefficient));
+      continue;
+    }
+    let wordTokens = Math.max(1, Math.ceil(token.length / tokenCoefficient));
+    const upper = token.match(/[A-Z]/g);
+    if (upper) {
+      wordTokens = Math.max(wordTokens - Math.floor(upper.length * 0.25), 1);
+    }
+    if (/[_]/.test(token)) {
+      wordTokens = Math.max(wordTokens - 1, 1);
+    }
+    count += wordTokens;
+  }
+  return count;
+}
+
+function countTextTokens(text) {
+  return tokenizeText(text);
+}
+
+function getAssistantPromptTokens(message) {
+  if (message?.info?.role !== "assistant") return null;
+  const tokens = message?.info?.tokens;
+  if (!tokens) return null;
+  const input = Number(tokens.input);
+  const cacheRead = Number(tokens.cache?.read);
+  const cacheWrite = Number(tokens.cache?.write);
+  if (![input, cacheRead, cacheWrite].every((n) => Number.isFinite(n) && n >= 0)) return null;
+  return input + cacheRead + cacheWrite;
+}
+
+function buildContextLedger(messages) {
+  const ledger = [];
+  let previous = 0;
+  for (const message of messages || []) {
+    if (message?.info?.synthetic) continue;
+    const contextTokens = getAssistantPromptTokens(message);
+    if (contextTokens === null) continue;
+    ledger.push({
+      messageID: message.info.id,
+      contextTokens,
+      deltaTokens: Math.max(0, contextTokens - previous),
+    });
+    previous = contextTokens;
+  }
+  return ledger;
+}
+
+function buildAssistantUsageRecords(messages) {
+  const records = [];
+  for (let index = 0; index < (messages || []).length; index++) {
+    const message = messages[index];
+    if (message?.info?.synthetic) continue;
+    const contextTokens = getAssistantPromptTokens(message);
+    if (contextTokens === null) continue;
+    records.push({
+      messageID: message.info.id,
+      parentID: message.info.parentID || null,
+      contextTokens,
+      index,
+    });
+  }
+  return records;
+}
+
+function sumMessageTokens(messages, startIndex = 0) {
+  return messages.slice(startIndex).reduce((s, m, messageIndex) => s + sumTokens(m, startIndex + messageIndex), 0);
+}
+
+function findCutIndexByContextUsage(messages, usageRecords, targetRetainedTokens) {
+  if (!Array.isArray(usageRecords) || usageRecords.length === 0) return -1;
+  if (usageRecords.length === 1) {
+    const only = usageRecords[0];
+    const parentIndex = only.parentID ? messages.findIndex((message) => message?.info?.id === only.parentID) : -1;
+    return parentIndex >= 0 ? parentIndex : only.index;
+  }
+
+  let keptTokens = 0;
+  let chosenRecord = null;
+
+  for (let i = usageRecords.length - 1; i > 0; i--) {
+    const newer = usageRecords[i];
+    const older = usageRecords[i - 1];
+    const delta = newer.contextTokens - older.contextTokens;
+    if (delta > 0) keptTokens += delta;
+    if (keptTokens >= targetRetainedTokens) {
+      chosenRecord = newer;
+      break;
+    }
+  }
+
+  if (!chosenRecord) {
+    chosenRecord = usageRecords[0];
+  }
+
+  const parentIndex = chosenRecord.parentID ? messages.findIndex((message) => message?.info?.id === chosenRecord.parentID) : -1;
+  return parentIndex >= 0 ? parentIndex : chosenRecord.index;
 }
 
 /**
@@ -436,29 +603,23 @@ function sumTokens(msg, messageIndex = -1) {
   for (let partIndex = 0; partIndex < msg.parts.length; partIndex++) {
     const p = msg.parts[partIndex];
     if (p.type === "text") {
-      const chars = (p.text || "").length;
-      const tokens = Math.ceil(chars / MSG_TOK_COEF);
+      const tokens = countTextTokens(p.text || "");
       s += tokens;
-      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=text chars=${chars} tokens=${tokens}`);
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=text chars=${(p.text || "").length} tokens=${tokens}`);
     }
     else if (p.type === "reasoning") {
-      const chars = (p.text || "").length;
-      const tokens = Math.ceil(chars / MSG_TOK_COEF);
-      s += tokens;
-      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=reasoning chars=${chars} tokens=${tokens}`);
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=reasoning chars=${(p.text || "").length} tokens=0 reason=excluded-from-provider-payload-estimate`);
     }
     else if (p.type === "tool") {
-      const serialized = JSON.stringify(p.state || "");
-      const chars = serialized.length;
-      const tokens = Math.ceil(chars / MSG_TOK_COEF);
+      const transcriptText = buildToolTranscriptText(p);
+      const tokens = countTextTokens(transcriptText);
       s += tokens;
-      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=tool chars=${chars} tokens=${tokens} source=JSON.stringify(part.state)`);
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=tool chars=${transcriptText.length} tokens=${tokens} source=tool-input-title-output-error`);
     }
     else if (p.text) {
-      const chars = p.text.length;
-      const tokens = Math.ceil(chars / MSG_TOK_COEF);
+      const tokens = countTextTokens(p.text);
       s += tokens;
-      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=${p.type || "unknown"} chars=${chars} tokens=${tokens} source=part.text`);
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=${p.type || "unknown"} chars=${p.text.length} tokens=${tokens} source=part.text`);
     } else {
       logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=${p.type || "unknown"} chars=0 tokens=0 reason=no-text`);
     }
@@ -529,7 +690,7 @@ function ensureStateDir() {
  * WHY:     To retrieve the rolling summary and the list of already compacted message IDs.
  * HOW:     Reads the JSON state file from STATE_DIR. Returns empty state if file doesn't exist or is invalid.
  * PARAMS:  sessionID: string — The active conversation session ID.
- * RETURNS: object — The loaded state containing { summary: string, summarizedIDs: Array<string>, summaryFailureCount: number }.
+ * RETURNS: object — The loaded state containing { summary: string, summarizedIDs: Array<string>, summaryFailureCount: number, contextLedger: Array<object> }.
  */
 function loadSessionState(sessionID) {
   ensureStateDir();
@@ -544,13 +705,22 @@ function loadSessionState(sessionID) {
           summaryFailureCount: Number.isFinite(Number(data.summaryFailureCount))
             ? Math.max(0, Math.floor(Number(data.summaryFailureCount)))
             : 0,
+          contextLedger: Array.isArray(data.contextLedger)
+            ? data.contextLedger
+                .map((entry) => ({
+                  messageID: typeof entry?.messageID === "string" ? entry.messageID : "",
+                  contextTokens: Number.isFinite(Number(entry?.contextTokens)) ? Math.max(0, Math.floor(Number(entry.contextTokens))) : 0,
+                  deltaTokens: Number.isFinite(Number(entry?.deltaTokens)) ? Math.max(0, Math.floor(Number(entry.deltaTokens))) : 0,
+                }))
+                .filter((entry) => entry.messageID)
+            : [],
         };
       }
     } catch (e) {
       log(`[state] Failed to load session state for ${sessionID}: ${e.message}`);
     }
   }
-  return { summary: "", summarizedIDs: [], summaryFailureCount: 0 };
+  return { summary: "", summarizedIDs: [], summaryFailureCount: 0, contextLedger: [] };
 }
 
 /**
@@ -561,9 +731,10 @@ function loadSessionState(sessionID) {
  *          summary: string — The updated rolling summary.
  *          summarizedIDs: Array<string> — The full list of compacted message IDs.
  *          summaryFailureCount: number — Count of consecutive summarization failures for adaptive backoff.
+ *          contextLedger: Array<object> — Rolling assistant context history for prompt-token deltas.
  * RETURNS: void
  */
-function saveSessionState(sessionID, summary, summarizedIDs, summaryFailureCount = 0) {
+function saveSessionState(sessionID, summary, summarizedIDs, summaryFailureCount = 0, contextLedger = []) {
   ensureStateDir();
   const filePath = join(STATE_DIR, `${sessionID}.json`);
   try {
@@ -576,6 +747,15 @@ function saveSessionState(sessionID, summary, summarizedIDs, summaryFailureCount
           summaryFailureCount: Number.isFinite(Number(summaryFailureCount))
             ? Math.max(0, Math.floor(Number(summaryFailureCount)))
             : 0,
+          contextLedger: Array.isArray(contextLedger)
+            ? contextLedger
+                .map((entry) => ({
+                  messageID: typeof entry?.messageID === "string" ? entry.messageID : "",
+                  contextTokens: Number.isFinite(Number(entry?.contextTokens)) ? Math.max(0, Math.floor(Number(entry.contextTokens))) : 0,
+                  deltaTokens: Number.isFinite(Number(entry?.deltaTokens)) ? Math.max(0, Math.floor(Number(entry.deltaTokens))) : 0,
+                }))
+                .filter((entry) => entry.messageID)
+            : [],
         },
         null,
         2,
@@ -583,7 +763,7 @@ function saveSessionState(sessionID, summary, summarizedIDs, summaryFailureCount
       "utf-8",
     );
     log(
-      `[state] Saved session state for ${sessionID} with ${summarizedIDs.length} messages and summaryFailureCount=${summaryFailureCount}.`,
+      `[state] Saved session state for ${sessionID} with ${summarizedIDs.length} messages, ledger=${Array.isArray(contextLedger) ? contextLedger.length : 0}, summaryFailureCount=${summaryFailureCount}.`,
     );
   } catch (e) {
     log(`[state] Failed to save session state for ${sessionID}: ${e.message}`);
@@ -640,18 +820,22 @@ function cleanupOldStateFiles(maxAgeDays = 30) {
  * RETURNS: Promise<object> — Object representing hooks.
  */
 export default async (_ctx, options = {}) => {
+  const maxTokens = options.maxContextTokens ?? options.maxContextLimit ?? DEFAULT_MAX_CONTEXT_TOKENS;
+  const minTokens = options.minContextTokens ?? options.minContextLimit ?? DEFAULT_MIN_CONTEXT_TOKENS;
   const summaryMaxTokens = options.summaryMaxTokens ?? 1000;
   const configuredSummaryModel = options.model;
+  const configuredTokenCoefficient = options.tokenCoefficient;
   const debug = options.debug ?? false;
   const debugRequestPayload = options.debugRequestPayload ?? false;
-  const maxMessages = options.maxContextMessages ?? 80;
-  const minMessages = options.minContextMessages ?? 50;
-  const failureBackoffStepMessages = options.failureBackoffStepMessages ?? 10;
-  const failureBackoffMaxOffsetMessages = options.failureBackoffMaxOffsetMessages ?? 50;
+  const failureBackoffStepTokens = options.failureBackoffStepTokens ?? DEFAULT_FAILURE_BACKOFF_STEP_TOKENS;
+  const failureBackoffMaxOffsetTokens = options.failureBackoffMaxOffsetTokens ?? DEFAULT_FAILURE_BACKOFF_MAX_OFFSET_TOKENS;
   const debugTokenCalc = options.debugTokenCalc ?? false;
 
   debugEnabled = Boolean(debug);
   tokenCalcDebugEnabled = Boolean(debug) && Boolean(debugTokenCalc);
+  tokenCoefficient = Number.isFinite(Number(configuredTokenCoefficient)) && Number(configuredTokenCoefficient) > 0
+    ? Number(configuredTokenCoefficient)
+    : DEFAULT_TOKEN_COEFFICIENT;
 
   if (debugEnabled) {
     log("MODULE LOADED");
@@ -660,7 +844,7 @@ export default async (_ctx, options = {}) => {
   installRequestPayloadDebug(debugEnabled && debugRequestPayload);
   cleanupOldStateFiles(30);
 
-  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextMessages=${maxMessages}, minContextMessages=${minMessages}, summaryMaxTokens=${summaryMaxTokens}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}, failureBackoffStepMessages=${failureBackoffStepMessages}, failureBackoffMaxOffsetMessages=${failureBackoffMaxOffsetMessages}`);
+  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextTokens=${maxTokens}, minContextTokens=${minTokens}, summaryMaxTokens=${summaryMaxTokens}, tokenCoefficient=${tokenCoefficient}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}, failureBackoffStepTokens=${failureBackoffStepTokens}, failureBackoffMaxOffsetTokens=${failureBackoffMaxOffsetTokens}`);
 
   return {
     "experimental.chat.messages.transform": async (_input, output) => {
@@ -676,19 +860,25 @@ export default async (_ctx, options = {}) => {
       const sessionState = loadSessionState(sessionID);
       log(`[hook] Loaded state for session ${sessionID}. Summarized count: ${sessionState.summarizedIDs.length}, summaryFailureCount=${sessionState.summaryFailureCount}`);
 
-      const sanitizedBackoffStep = Number.isFinite(Number(failureBackoffStepMessages))
-        ? Math.max(0, Math.floor(Number(failureBackoffStepMessages)))
-        : 10;
-      const sanitizedBackoffMaxOffset = Number.isFinite(Number(failureBackoffMaxOffsetMessages))
-        ? Math.max(0, Math.floor(Number(failureBackoffMaxOffsetMessages)))
-        : 50;
+      const sanitizedMaxTokens = Number.isFinite(Number(maxTokens))
+        ? Math.max(1, Math.floor(Number(maxTokens)))
+        : DEFAULT_MAX_CONTEXT_TOKENS;
+      const sanitizedMinTokens = Number.isFinite(Number(minTokens))
+        ? Math.max(0, Math.floor(Number(minTokens)))
+        : DEFAULT_MIN_CONTEXT_TOKENS;
+      const sanitizedBackoffStep = Number.isFinite(Number(failureBackoffStepTokens))
+        ? Math.max(0, Math.floor(Number(failureBackoffStepTokens)))
+        : DEFAULT_FAILURE_BACKOFF_STEP_TOKENS;
+      const sanitizedBackoffMaxOffset = Number.isFinite(Number(failureBackoffMaxOffsetTokens))
+        ? Math.max(0, Math.floor(Number(failureBackoffMaxOffsetTokens)))
+        : DEFAULT_FAILURE_BACKOFF_MAX_OFFSET_TOKENS;
       const failureCount = Number.isFinite(Number(sessionState.summaryFailureCount))
         ? Math.max(0, Math.floor(Number(sessionState.summaryFailureCount)))
         : 0;
       const currentBackoffOffset = Math.min(failureCount * sanitizedBackoffStep, sanitizedBackoffMaxOffset);
-      const effectiveMaxMessages = maxMessages + currentBackoffOffset;
-      const hardMaxMessages = maxMessages + sanitizedBackoffMaxOffset;
-      const hardMinMessages = minMessages + sanitizedBackoffMaxOffset;
+      const effectiveMaxTokens = sanitizedMaxTokens + currentBackoffOffset;
+      const hardMaxTokens = sanitizedMaxTokens + sanitizedBackoffMaxOffset;
+      const hardMinTokens = sanitizedMinTokens + sanitizedBackoffMaxOffset;
 
       // 1. Filter out already-summarized messages and synthetic summary messages.
       const summarizedSet = new Set(sessionState.summarizedIDs);
@@ -718,75 +908,62 @@ export default async (_ctx, options = {}) => {
         logTokenCalc("================================================================================");
         logTokenCalc(`[transform:start] sessionID=${sessionID} messages=${messages.length}`);
       }
-      const activeCount = messages.filter((m) => !m.info?.synthetic).length;
-      const totalTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
-      log(`[hook] Reconstructed messages=${messages.length}, activeMessages=${activeCount}, maxContextMessages=${maxMessages}, effectiveMaxMessages=${effectiveMaxMessages}, hardMaxMessages=${hardMaxMessages}, minContextMessages=${minMessages}, hardMinMessages=${hardMinMessages}, summaryFailureCount=${failureCount}, currentBackoffOffset=${currentBackoffOffset}, estimatedTokens=${totalTokens}`);
-      logTokenCalc(`[transform:reconstructed] activeMessages=${activeCount} maxContextMessages=${maxMessages} effectiveMaxMessages=${effectiveMaxMessages} hardMaxMessages=${hardMaxMessages} minContextMessages=${minMessages} hardMinMessages=${hardMinMessages} summaryFailureCount=${failureCount} currentBackoffOffset=${currentBackoffOffset} estimatedTokens=${totalTokens}`);
-      
-      if (activeCount < effectiveMaxMessages) {
-        log("[hook] Below effectiveMaxMessages, returning reconstructed context.");
+
+      const activeMessages = messages.filter((m) => !m.info?.synthetic);
+      const activeCount = activeMessages.length;
+      const activeMessageTokens = activeMessages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
+      const usageRecords = buildAssistantUsageRecords(messages);
+      const latestUsage = usageRecords.length > 0 ? usageRecords[usageRecords.length - 1] : null;
+      const latestContextTokens = latestUsage?.contextTokens || 0;
+
+      log(`[hook] Reconstructed messages=${messages.length}, activeMessages=${activeCount}, activeMessageTokens=${activeMessageTokens}, latestContextTokens=${latestContextTokens}, maxContextTokens=${sanitizedMaxTokens}, effectiveMaxTokens=${effectiveMaxTokens}, hardMaxTokens=${hardMaxTokens}, minContextTokens=${sanitizedMinTokens}, hardMinTokens=${hardMinTokens}, summaryFailureCount=${failureCount}, currentBackoffOffset=${currentBackoffOffset}`);
+      logTokenCalc(`[transform:reconstructed] activeMessages=${activeCount} activeMessageTokens=${activeMessageTokens} latestContextTokens=${latestContextTokens} maxContextTokens=${sanitizedMaxTokens} effectiveMaxTokens=${effectiveMaxTokens} hardMaxTokens=${hardMaxTokens} minContextTokens=${sanitizedMinTokens} hardMinTokens=${hardMinTokens} summaryFailureCount=${failureCount} currentBackoffOffset=${currentBackoffOffset}`);
+
+      if (latestContextTokens < effectiveMaxTokens) {
+        log("[hook] Below effectiveMaxTokens, returning reconstructed context.");
         return output;
       }
 
       // Re-map tool call indexes on the active messages.
-      const callIDUseIndex = new Map();
       const callIDResultIndex = new Map();
       for (let i = 0; i < messages.length; i++) {
         for (const p of messages[i].parts) {
           if (p.type !== "tool" || !p.callID) continue;
-          if (p.state?.status === "pending" || p.state?.status === "running") {
-            callIDUseIndex.set(p.callID, i);
-          } else if (p.state?.status === "completed" || p.state?.status === "error") {
+          if (p.state?.status === "completed" || p.state?.status === "error") {
             callIDResultIndex.set(p.callID, i);
           }
         }
       }
 
-      let accumulated = 0;
-      let cutIndex = 0;
-      let lastUseCallID = null;
-
-      // Start evaluation from index 1 if index 0 is the synthetic summary message.
       const startIndex = (messages[0]?.info?.synthetic) ? 1 : 0;
-
-      const isHardLimitExceeded = activeCount > hardMaxMessages;
-      const targetRetainedMessages = isHardLimitExceeded ? hardMinMessages : minMessages;
-
-      for (let i = startIndex; i < messages.length; i++) {
-        const msgTok = sumTokens(messages[i], i);
-        accumulated += msgTok;
-
-        for (const p of messages[i].parts) {
-          if (p.type === "tool" && (p.state?.status === "pending" || p.state?.status === "running")) {
-            lastUseCallID = p.callID;
-          }
-        }
-
-        const remainingMessages = messages.length - (i + 1);
-        if (remainingMessages <= targetRetainedMessages) {
-          cutIndex = i + 1;
-          break;
-        }
-      }
+      const isHardLimitExceeded = latestContextTokens > hardMaxTokens;
+      const targetRetainedTokens = isHardLimitExceeded ? hardMinTokens : sanitizedMinTokens;
+      let cutIndex = findCutIndexByContextUsage(messages, usageRecords, targetRetainedTokens);
 
       if (cutIndex <= startIndex) {
         log(`[hook] cutIndex (${cutIndex}) <= startIndex (${startIndex}), nothing to prune.`);
         return output;
       }
 
-      if (lastUseCallID) {
-        const resultIdx = callIDResultIndex.get(lastUseCallID);
+      const pruned = messages.slice(startIndex, cutIndex);
+      let kept = messages.slice(cutIndex);
+
+      const lastPrunedToolUse = pruned
+        .flatMap((m) => m.parts || [])
+        .filter((p) => p.type === "tool" && (p.state?.status === "pending" || p.state?.status === "running") && p.callID)
+        .at(-1)?.callID || null;
+      if (lastPrunedToolUse) {
+        const resultIdx = callIDResultIndex.get(lastPrunedToolUse);
         if (resultIdx !== undefined && resultIdx >= cutIndex) {
-          log(`extending cutIndex ${cutIndex} -> ${resultIdx + 1} to include tool result for ${lastUseCallID}`);
+          log(`extending cutIndex ${cutIndex} -> ${resultIdx + 1} to include tool result for ${lastPrunedToolUse}`);
           cutIndex = resultIdx + 1;
+          kept = messages.slice(cutIndex);
         }
       }
 
-      const beforeTokens = totalTokens;
+      const beforeTokens = latestContextTokens;
       const activeBeforeCount = messages.length - startIndex;
-      const pruned = messages.slice(startIndex, cutIndex);
-      const kept = messages.slice(cutIndex);
-
+      
       let summaryText = sessionState.summary;
       let summaryError = null;
       let nextFailureCount = failureCount;
@@ -848,25 +1025,27 @@ ${summaryText}
             .filter((id) => id);
 
           const updatedSummarizedIDs = [...sessionState.summarizedIDs, ...newlySummarizedIDs];
-          saveSessionState(sessionID, summaryText, updatedSummarizedIDs, nextFailureCount);
+          const nextContextLedger = buildContextLedger([...messages.slice(0, startIndex), ...kept]);
+          saveSessionState(sessionID, summaryText, updatedSummarizedIDs, nextFailureCount, nextContextLedger);
 
         } catch (err) {
           summaryError = err;
           nextFailureCount = failureCount + 1;
 
           if (!isHardLimitExceeded) {
-            log(`Summarization execution failed: ${err.message}. Hard limit not exceeded (activeCount=${activeCount}, hardMaxMessages=${hardMaxMessages}); skipping prune and increasing summaryFailureCount to ${nextFailureCount}.`);
-            saveSessionState(sessionID, sessionState.summary, sessionState.summarizedIDs, nextFailureCount);
+            log(`Summarization execution failed: ${err.message}. Hard limit not exceeded (latestContextTokens=${latestContextTokens}, hardMaxTokens=${hardMaxTokens}); skipping prune and increasing summaryFailureCount to ${nextFailureCount}.`);
+            saveSessionState(sessionID, sessionState.summary, sessionState.summarizedIDs, nextFailureCount, buildContextLedger(messages));
             return output;
           }
 
-          log(`Summarization execution failed: ${err.message}. Hard limit exceeded (activeCount=${activeCount}, hardMaxMessages=${hardMaxMessages}); forcing prune to hardMinMessages=${hardMinMessages} and increasing summaryFailureCount to ${nextFailureCount}.`);
+          log(`Summarization execution failed: ${err.message}. Hard limit exceeded (latestContextTokens=${latestContextTokens}, hardMaxTokens=${hardMaxTokens}); forcing prune to hardMinTokens=${hardMinTokens} and increasing summaryFailureCount to ${nextFailureCount}.`);
 
           const newlySummarizedIDs = pruned
             .map((m) => m.info?.id)
             .filter((id) => id);
           const updatedSummarizedIDs = [...sessionState.summarizedIDs, ...newlySummarizedIDs];
-          saveSessionState(sessionID, sessionState.summary, updatedSummarizedIDs, nextFailureCount);
+          const nextContextLedger = buildContextLedger([...messages.slice(0, startIndex), ...kept]);
+          saveSessionState(sessionID, sessionState.summary, updatedSummarizedIDs, nextFailureCount, nextContextLedger);
         }
       }
 
@@ -880,14 +1059,19 @@ ${summaryText}
 
       messages.push(...kept);
 
-      const afterTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
+      const afterActiveTokens = messages
+        .filter((m) => !m.info?.synthetic)
+        .reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
+      const afterTotalTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
+      const afterLatestUsage = buildAssistantUsageRecords(messages).at(-1) || null;
+      const afterLatestContextTokens = afterLatestUsage?.contextTokens || 0;
       const removedIndices = [];
       for (let i = startIndex; i < cutIndex; i++) removedIndices.push(i);
 
-      log(`pruned: ${pruned.length} messages. Remaining active messages: ${messages.length}. totalTokens=${afterTokens}`);
-      logTokenCalc(`[transform:final] pruned=${pruned.length} remainingMessages=${messages.length} totalTokens=${afterTokens}`);
+      log(`pruned: ${pruned.length} messages. Remaining active messages: ${messages.length}. activeMessageTokens=${afterActiveTokens} latestContextTokens=${afterLatestContextTokens} totalTokens=${afterTotalTokens}`);
+      logTokenCalc(`[transform:final] pruned=${pruned.length} remainingMessages=${messages.length} activeMessageTokens=${afterActiveTokens} latestContextTokens=${afterLatestContextTokens} totalTokens=${afterTotalTokens}`);
 
-      writeDebugLog(debug, sessionID, activeBeforeCount, beforeTokens, messages.length, afterTokens, removedIndices, messages);
+      writeDebugLog(debug, sessionID, activeBeforeCount, beforeTokens, messages.length, afterTotalTokens, removedIndices, messages);
 
       if (summaryError) {
         console.error(`[auto-compress] Summarization failed; context was still pruned: ${summaryError.message}`);
