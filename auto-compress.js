@@ -458,6 +458,8 @@ RULES:
 - Do not repeat old facts unless needed to make the continuation understandable.
 - Write the new chunk as a chronological continuation of the workflow.
 - Preserve the work flow: what the user wanted, what was inspected, what was tried, what changed, what was verified, and what remained unresolved.
+- Assistant reasoning/work notes may appear inside explicit [REASONING] blocks in NEW PRUNED MESSAGES. Use them as evidence for workflow continuity, intent, decisions, course corrections, and validation.
+- Do not quote, imitate, or reproduce [REASONING] blocks verbatim. Distill them into concise factual workflow narrative.
 - If the segment continues prior work, make the transition clear.
 - If the segment completes, changes, abandons, or corrects something from prior summaries, mention that naturally in the chronology.
 - If there were false starts or course corrections, collapse them into the final resolved understanding while preserving important decisions.
@@ -1144,6 +1146,10 @@ export default async (_ctx, options = {}) => {
               if (p.type === "text") {
                 const value = stripSystemReminderBlocks(p.text);
                 return value ? [value] : [];
+              }
+              if (p.type === "reasoning") {
+                const value = stripSystemReminderBlocks(p.text);
+                return value ? [`[REASONING]\n${value}\n[/REASONING]`] : [];
               }
               return [];
             })
