@@ -8,7 +8,7 @@
  * DEPENDENCIES: fs, path, os, @opencode-ai/plugin, @opencode-ai/sdk
  */
 
-import { writeFileSync, mkdirSync, existsSync, appendFileSync, readFileSync, readdirSync, statSync, unlinkSync } from "fs";
+import { writeFileSync, mkdirSync, existsSync, appendFileSync, readFileSync, readdirSync, statSync, unlinkSync, rmSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -17,9 +17,11 @@ const DEFAULT_MAX_CONTEXT_TOKENS = 40000;
 const DEFAULT_MIN_CONTEXT_TOKENS = 20000;
 const DEFAULT_FAILURE_BACKOFF_STEP_TOKENS = 5000;
 const DEFAULT_FAILURE_BACKOFF_MAX_OFFSET_TOKENS = 25000;
+const DEFAULT_MAX_SUMMARY_FILES = 5;
 const DEBUG_DIR = join(homedir(), ".config", "opencode", "logs", "auto-compress");
 const LOG_FILE = join(DEBUG_DIR, "auto-compress.log");
 const TOKEN_LOG_FILE = join(DEBUG_DIR, "token-calc.log");
+const SUMMARY_DIR = join(DEBUG_DIR, "summaries");
 let fetchDebugInstalled = false;
 let debugEnabled = false;
 let tokenCalcDebugEnabled = false;
@@ -236,34 +238,29 @@ function sumMessageTokens(messages, startIndex = 0) {
   return messages.slice(startIndex).reduce((s, m, messageIndex) => s + sumTokens(m, startIndex + messageIndex), 0);
 }
 
-function findCutIndexByContextUsage(messages, usageRecords, targetRetainedTokens) {
-  if (!Array.isArray(usageRecords) || usageRecords.length === 0) return -1;
-  if (usageRecords.length === 1) {
-    const only = usageRecords[0];
-    const parentIndex = only.parentID ? messages.findIndex((message) => message?.info?.id === only.parentID) : -1;
-    return parentIndex >= 0 ? parentIndex : only.index;
-  }
+function findCutIndexByEstimatedTokens(messages, startIndex, targetRetainedTokens) {
+  if (!Array.isArray(messages) || messages.length === 0) return -1;
 
   let keptTokens = 0;
-  let chosenRecord = null;
+  let chosenIndex = -1;
 
-  for (let i = usageRecords.length - 1; i > 0; i--) {
-    const newer = usageRecords[i];
-    const older = usageRecords[i - 1];
-    const delta = newer.contextTokens - older.contextTokens;
-    if (delta > 0) keptTokens += delta;
+  for (let i = messages.length - 1; i >= startIndex; i--) {
+    keptTokens += sumTokens(messages[i], i);
     if (keptTokens >= targetRetainedTokens) {
-      chosenRecord = newer;
+      chosenIndex = i;
       break;
     }
   }
 
-  if (!chosenRecord) {
-    chosenRecord = usageRecords[0];
+  if (chosenIndex < 0) {
+    return startIndex;
   }
 
-  const parentIndex = chosenRecord.parentID ? messages.findIndex((message) => message?.info?.id === chosenRecord.parentID) : -1;
-  return parentIndex >= 0 ? parentIndex : chosenRecord.index;
+  const chosenMessage = messages[chosenIndex];
+  const parentIndex = chosenMessage?.info?.parentID
+    ? messages.findIndex((message) => message?.info?.id === chosenMessage.info.parentID)
+    : -1;
+  return parentIndex >= startIndex ? parentIndex : chosenIndex;
 }
 
 /**
@@ -287,14 +284,31 @@ function normalizeLegacySummaryHeadings(text) {
 /**
  * WHAT:    Builds the synthetic summary message inserted into active context.
  * WHY:     Ensures historical summary framing and stable per-message IDs.
- * HOW:     Generates one shared summary message ID and one part ID, then returns a user-role synthetic message.
+ * HOW:     Bundles persisted per-session summary chunks into one shared synthetic message.
  * PARAMS:  sessionID: string — Active session identifier.
- *          summaryText: string — Historical summary text to embed.
+ *          summaryEntries: Array<object> — Historical summary chunks to embed in chronological order.
  * RETURNS: object — Synthetic summary message compatible with OpenCode message schema.
  */
-function buildSummaryMessage(sessionID, summaryText) {
-  const normalizedSummary = normalizeLegacySummaryHeadings(summaryText);
-  const summaryTextFormatted = `### CONTEXT SUMMARY: PRUNED HISTORY ONLY\nThis is a historical summary of messages removed from context.\nIt is older than all retained messages that follow.\nUse it as background only; retained messages override it on conflicts.\n\n\`\`\`xml\n<pruned_history_summary>\n${normalizedSummary}\n</pruned_history_summary>\n\`\`\``;
+function sanitizeSummaryText(text) {
+  return normalizeLegacySummaryHeadings(stripSystemReminderBlocks(text)).trim();
+}
+
+function buildSummaryMessage(sessionID, summaryEntries) {
+  const normalizedEntries = Array.isArray(summaryEntries)
+    ? summaryEntries
+        .map((entry) => ({
+          fileName: typeof entry?.fileName === "string" ? entry.fileName : "",
+          text: sanitizeSummaryText(entry?.text || ""),
+        }))
+        .filter((entry) => entry.fileName && entry.text)
+    : [];
+
+  if (normalizedEntries.length === 0) return null;
+
+  const summaryBody = normalizedEntries
+    .map((entry, index) => `<summary file="${entry.fileName}" order="${index + 1}" chronology="${index === normalizedEntries.length - 1 ? "newest" : "older"}">\n${entry.text}\n</summary>`)
+    .join("\n\n");
+  const summaryTextFormatted = `### CONTEXT SUMMARIES: PRUNED HISTORY ONLY\nThese are historical segment summaries of messages removed from context.\nOlder summaries appear first. Newer summaries override older ones on conflicts.\nUse them as background only; retained messages that follow are newer than all summaries here.\n\n\`\`\`xml\n<pruned_history_summaries>\n${summaryBody}\n</pruned_history_summaries>\n\`\`\``;
   const now = Date.now();
   const summaryID = `summary-${now}`;
   const summaryPartID = `summary-part-${now}`;
@@ -430,37 +444,35 @@ async function summarizePrunedMessages(client, transcript, buildModel, summaryMa
       ? Math.max(1, Math.floor(Number(summaryMaxTokens)))
       : 1000;
     const summaryPrompt = `TASK:
-Update the previous project summary with the new messages.
+Update the previous project summary history by writing the next chronological workflow summary chunk for a long-running coding session.
+
+This chunk will be appended after the existing historical summaries. It should read like the next part of the same project log, not like a standalone report and not like a checklist.
+
+INPUT STRUCTURE:
+- EXISTING HISTORICAL SUMMARIES: older retained summaries, in chronological order.
+- NEW PRUNED MESSAGES: the newly pruned conversation segment.
 
 RULES:
-- The output summarizes only pruned history and not the retained messages that follow in runtime context.
-- Use temporally explicit labels so historical state is not interpreted as the active request.
-- Treat retained messages (outside this input) as newer context that can override this summary.
-- Keep only project-related facts.
-- Remove chit-chat, off-topic text, English corrections, repeated dialogue, and tool/meta discussion.
-- Preserve important file paths, commands, errors, decisions, implementation status, and open items.
-- If new messages prove an open item was completed, move it to Completed.
-- If a new unfinished task appears, put it under Last known task before retained messages.
+- Summarize only NEW PRUNED MESSAGES, but use EXISTING HISTORICAL SUMMARIES to understand continuity, names, unresolved work, decisions, and why the new messages matter.
+- Do not rewrite, merge, or restate the old summaries.
+- Do not repeat old facts unless needed to make the continuation understandable.
+- Write the new chunk as a chronological continuation of the workflow.
+- Preserve the work flow: what the user wanted, what was inspected, what was tried, what changed, what was verified, and what remained unresolved.
+- If the segment continues prior work, make the transition clear.
+- If the segment completes, changes, abandons, or corrects something from prior summaries, mention that naturally in the chronology.
+- If there were false starts or course corrections, collapse them into the final resolved understanding while preserving important decisions.
+- Keep project-relevant engineering facts: file paths, commands, errors, tests, commits, config changes, implementation details, decisions, and open items.
+- Remove chit-chat, repeated dialogue, English corrections, assistant meta-talk, hidden reasoning, system reminders, and irrelevant tool noise.
+- Prefer compact technical prose over rigid sections.
+- Use bullets only when they naturally improve readability, for example for multiple files, commands, tests, or open items.
+- Treat retained messages outside this input as newer context that can override this chunk.
 - Never answer the conversation.
-- Never continue the conversation.
+- Never continue the conversation as assistant.
 - Do not reproduce the transcript.
 - Keep the summary under approximately ${targetSummaryTokens} tokens.
 
-OUTPUT FORMAT:
-Last known task before retained messages:
-- ...
-
-Files referenced in pruned history:
-- path: fact
-
-Completed before retained messages:
-- ...
-
-Decisions from pruned history:
-- ...
-
-Open items at end of pruned history:
-- ...
+STYLE:
+Write as a compact chronological project log. The result should feel like it flows directly after the previous retained summaries. Do not use a fixed template or mandatory headings. End with the latest known state only if it is clear from NEW PRUNED MESSAGES.
 
 INPUT:
 ${transcript}`;
@@ -566,7 +578,7 @@ ${transcript}`;
       throw new Error("No assistant message found in summary session.");
     }
 
-    const summaryText = assistantMsg.parts?.find((p) => p.type === "text")?.text;
+    const summaryText = sanitizeSummaryText(assistantMsg.parts?.find((p) => p.type === "text")?.text || "");
     if (!summaryText) {
       throw new Error("No text found in summary response assistant message.");
     }
@@ -608,7 +620,9 @@ function sumTokens(msg, messageIndex = -1) {
       logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=text chars=${(p.text || "").length} tokens=${tokens}`);
     }
     else if (p.type === "reasoning") {
-      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=reasoning chars=${(p.text || "").length} tokens=0 reason=excluded-from-provider-payload-estimate`);
+      const tokens = countTextTokens(p.text || "");
+      s += tokens;
+      logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=reasoning chars=${(p.text || "").length} tokens=${tokens} source=reasoning-text`);
     }
     else if (p.type === "tool") {
       const transcriptText = buildToolTranscriptText(p);
@@ -672,6 +686,154 @@ function writeDebugLog(debug, sessionID, beforeCount, beforeTokens, afterCount, 
 
 const STATE_DIR = join(DEBUG_DIR, "state");
 
+function ensureSummaryDir() {
+  if (!existsSync(SUMMARY_DIR)) {
+    mkdirSync(SUMMARY_DIR, { recursive: true });
+  }
+}
+
+function getSessionSummaryDir(sessionID) {
+  return join(SUMMARY_DIR, sessionID);
+}
+
+function ensureSessionSummaryDir(sessionID) {
+  ensureSummaryDir();
+  const sessionDir = getSessionSummaryDir(sessionID);
+  if (!existsSync(sessionDir)) {
+    mkdirSync(sessionDir, { recursive: true });
+  }
+  return sessionDir;
+}
+
+function parseSummarySequence(fileName) {
+  const match = /^(\d{6})\.md$/.exec(fileName || "");
+  return match ? Number(match[1]) : null;
+}
+
+function listSessionSummaryEntries(sessionID) {
+  ensureSummaryDir();
+  const sessionDir = getSessionSummaryDir(sessionID);
+  if (!existsSync(sessionDir)) return [];
+
+  return readdirSync(sessionDir)
+    .filter((fileName) => parseSummarySequence(fileName) !== null)
+    .sort((a, b) => parseSummarySequence(a) - parseSummarySequence(b))
+    .map((fileName) => {
+      const filePath = join(sessionDir, fileName);
+      try {
+        const text = sanitizeSummaryText(readFileSync(filePath, "utf-8"));
+        return text ? { fileName, filePath, text } : null;
+      } catch (e) {
+        log(`[summary] Failed reading ${filePath}: ${e.message}`);
+        return null;
+      }
+    })
+    .filter((entry) => entry && entry.text);
+}
+
+function appendSessionSummary(sessionID, summaryText, maxSummaryFiles = DEFAULT_MAX_SUMMARY_FILES) {
+  const sanitizedText = sanitizeSummaryText(summaryText);
+  if (!sanitizedText) {
+    throw new Error("Refusing to persist empty session summary chunk.");
+  }
+
+  const sessionDir = ensureSessionSummaryDir(sessionID);
+  const existingEntries = listSessionSummaryEntries(sessionID);
+  const highestSequence = existingEntries.reduce((maxValue, entry) => {
+    const seq = parseSummarySequence(entry.fileName);
+    return seq !== null ? Math.max(maxValue, seq) : maxValue;
+  }, 0);
+  const nextSequence = highestSequence + 1;
+  const fileName = `${String(nextSequence).padStart(6, "0")}.md`;
+  const filePath = join(sessionDir, fileName);
+
+  writeFileSync(filePath, `${sanitizedText}\n`, "utf-8");
+
+  const retentionLimit = Number.isFinite(Number(maxSummaryFiles))
+    ? Math.max(1, Math.floor(Number(maxSummaryFiles)))
+    : DEFAULT_MAX_SUMMARY_FILES;
+  const updatedEntries = listSessionSummaryEntries(sessionID);
+  const overflowEntries = updatedEntries.slice(0, Math.max(0, updatedEntries.length - retentionLimit));
+  for (const entry of overflowEntries) {
+    try {
+      unlinkSync(entry.filePath);
+    } catch (e) {
+      log(`[summary] Failed deleting old summary chunk ${entry.filePath}: ${e.message}`);
+    }
+  }
+
+  log(`[summary] Appended summary chunk ${fileName} for ${sessionID}; retentionLimit=${retentionLimit}.`);
+  return listSessionSummaryEntries(sessionID);
+}
+
+function buildHistoricalSummaryContext(summaryEntries) {
+  if (!Array.isArray(summaryEntries) || summaryEntries.length === 0) {
+    return "EXISTING HISTORICAL SUMMARIES:\n(none)";
+  }
+
+  const body = summaryEntries
+    .map((entry) => `### ${entry.fileName}\n${sanitizeSummaryText(entry.text)}`)
+    .join("\n\n");
+  return `EXISTING HISTORICAL SUMMARIES:\n${body}`;
+}
+
+function cleanupOldSummaryDirectories(maxAgeDays = 30) {
+  try {
+    if (!existsSync(SUMMARY_DIR)) return;
+    const now = Date.now();
+    const cutoffMs = maxAgeDays * 24 * 60 * 60 * 1000;
+    let removed = 0;
+
+    for (const name of readdirSync(SUMMARY_DIR)) {
+      const dirPath = join(SUMMARY_DIR, name);
+      let stat;
+      try {
+        stat = statSync(dirPath);
+      } catch {
+        continue;
+      }
+      if (!stat.isDirectory()) continue;
+      if (now - stat.mtimeMs <= cutoffMs) continue;
+      try {
+        rmSync(dirPath, { recursive: true, force: true });
+        removed++;
+      } catch (e) {
+        log(`[summary-cleanup] Failed deleting ${dirPath}: ${e.message}`);
+      }
+    }
+
+    if (removed > 0) {
+      log(`[summary-cleanup] Removed ${removed} summary director${removed === 1 ? "y" : "ies"} older than ${maxAgeDays} days.`);
+    }
+  } catch (e) {
+    log(`[summary-cleanup] Failed: ${e.message}`);
+  }
+}
+
+function migrateLegacySummaryIfNeeded(sessionID, sessionState, maxSummaryFiles) {
+  const legacySummary = sanitizeSummaryText(sessionState?.summary || "");
+  if (!legacySummary) return { ...sessionState, summary: "" };
+
+  const existingEntries = listSessionSummaryEntries(sessionID);
+  if (existingEntries.length === 0) {
+    appendSessionSummary(sessionID, legacySummary, maxSummaryFiles);
+    log(`[summary] Migrated legacy rolling summary into summary chunks for ${sessionID}.`);
+  }
+
+  const nextState = {
+    ...sessionState,
+    summary: "",
+  };
+  saveSessionState(
+    sessionID,
+    nextState.summary,
+    nextState.summarizedIDs,
+    nextState.summaryFailureCount,
+    nextState.contextLedger,
+  );
+  return nextState;
+}
+
 /**
  * WHAT:    Ensures that the session state directory exists.
  * WHY:     To prevent write failures when saving the persistent session state files.
@@ -687,7 +849,7 @@ function ensureStateDir() {
 
 /**
  * WHAT:    Loads the persistent summary state for a given session.
- * WHY:     To retrieve the rolling summary and the list of already compacted message IDs.
+ * WHY:     To retrieve compacted message IDs, failure counters, and any legacy rolling summary awaiting migration.
  * HOW:     Reads the JSON state file from STATE_DIR. Returns empty state if file doesn't exist or is invalid.
  * PARAMS:  sessionID: string — The active conversation session ID.
  * RETURNS: object — The loaded state containing { summary: string, summarizedIDs: Array<string>, summaryFailureCount: number, contextLedger: Array<object> }.
@@ -725,10 +887,10 @@ function loadSessionState(sessionID) {
 
 /**
  * WHAT:    Saves the persistent summary state for a given session.
- * WHY:     To preserve the rolling summary and compacted message IDs across chat turn reloads.
+ * WHY:     To preserve compacted message IDs and failure state across chat turn reloads.
  * HOW:     Writes the JSON state to STATE_DIR.
  * PARAMS:  sessionID: string — The active conversation session ID.
- *          summary: string — The updated rolling summary.
+ *          summary: string — Legacy rolling summary slot retained for migration compatibility.
  *          summarizedIDs: Array<string> — The full list of compacted message IDs.
  *          summaryFailureCount: number — Count of consecutive summarization failures for adaptive backoff.
  *          contextLedger: Array<object> — Rolling assistant context history for prompt-token deltas.
@@ -830,6 +992,7 @@ export default async (_ctx, options = {}) => {
   const failureBackoffStepTokens = options.failureBackoffStepTokens ?? DEFAULT_FAILURE_BACKOFF_STEP_TOKENS;
   const failureBackoffMaxOffsetTokens = options.failureBackoffMaxOffsetTokens ?? DEFAULT_FAILURE_BACKOFF_MAX_OFFSET_TOKENS;
   const debugTokenCalc = options.debugTokenCalc ?? false;
+  const maxSummaryFiles = options.maxSummaryFiles ?? DEFAULT_MAX_SUMMARY_FILES;
 
   debugEnabled = Boolean(debug);
   tokenCalcDebugEnabled = Boolean(debug) && Boolean(debugTokenCalc);
@@ -843,8 +1006,9 @@ export default async (_ctx, options = {}) => {
 
   installRequestPayloadDebug(debugEnabled && debugRequestPayload);
   cleanupOldStateFiles(30);
+  cleanupOldSummaryDirectories(30);
 
-  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextTokens=${maxTokens}, minContextTokens=${minTokens}, summaryMaxTokens=${summaryMaxTokens}, tokenCoefficient=${tokenCoefficient}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}, failureBackoffStepTokens=${failureBackoffStepTokens}, failureBackoffMaxOffsetTokens=${failureBackoffMaxOffsetTokens}`);
+  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextTokens=${maxTokens}, minContextTokens=${minTokens}, summaryMaxTokens=${summaryMaxTokens}, tokenCoefficient=${tokenCoefficient}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}, failureBackoffStepTokens=${failureBackoffStepTokens}, failureBackoffMaxOffsetTokens=${failureBackoffMaxOffsetTokens}, maxSummaryFiles=${maxSummaryFiles}`);
 
   return {
     "experimental.chat.messages.transform": async (_input, output) => {
@@ -857,8 +1021,10 @@ export default async (_ctx, options = {}) => {
       }
 
       const sessionID = messages.find((m) => m.info?.sessionID)?.info?.sessionID || "unknown";
-      const sessionState = loadSessionState(sessionID);
-      log(`[hook] Loaded state for session ${sessionID}. Summarized count: ${sessionState.summarizedIDs.length}, summaryFailureCount=${sessionState.summaryFailureCount}`);
+      let sessionState = loadSessionState(sessionID);
+      sessionState = migrateLegacySummaryIfNeeded(sessionID, sessionState, maxSummaryFiles);
+      let summaryEntries = listSessionSummaryEntries(sessionID);
+      log(`[hook] Loaded state for session ${sessionID}. Summarized count: ${sessionState.summarizedIDs.length}, summaryFiles=${summaryEntries.length}, summaryFailureCount=${sessionState.summaryFailureCount}`);
 
       const sanitizedMaxTokens = Number.isFinite(Number(maxTokens))
         ? Math.max(1, Math.floor(Number(maxTokens)))
@@ -895,10 +1061,12 @@ export default async (_ctx, options = {}) => {
       // Clear the original messages array and rebuild it.
       messages.length = 0;
 
-      // 2. Prepend the previous summary if one exists.
-      if (sessionState.summary) {
-        const summaryMessage = buildSummaryMessage(sessionID, sessionState.summary);
-        messages.push(summaryMessage);
+      // 2. Prepend the persisted summary bundle if one exists.
+      if (summaryEntries.length > 0) {
+        const summaryMessage = buildSummaryMessage(sessionID, summaryEntries);
+        if (summaryMessage) {
+          messages.push(summaryMessage);
+        }
       }
 
       // Add the remaining active messages.
@@ -938,7 +1106,7 @@ export default async (_ctx, options = {}) => {
       const startIndex = (messages[0]?.info?.synthetic) ? 1 : 0;
       const isHardLimitExceeded = latestContextTokens > hardMaxTokens;
       const targetRetainedTokens = isHardLimitExceeded ? hardMinTokens : sanitizedMinTokens;
-      let cutIndex = findCutIndexByContextUsage(messages, usageRecords, targetRetainedTokens);
+      let cutIndex = findCutIndexByEstimatedTokens(messages, startIndex, targetRetainedTokens);
 
       if (cutIndex <= startIndex) {
         log(`[hook] cutIndex (${cutIndex}) <= startIndex (${startIndex}), nothing to prune.`);
@@ -964,7 +1132,7 @@ export default async (_ctx, options = {}) => {
       const beforeTokens = latestContextTokens;
       const activeBeforeCount = messages.length - startIndex;
       
-      let summaryText = sessionState.summary;
+      let latestSummaryEntryText = summaryEntries.length > 0 ? summaryEntries[summaryEntries.length - 1].text : "";
       let summaryError = null;
       let nextFailureCount = failureCount;
       if (pruned.length > 0) {
@@ -972,9 +1140,13 @@ export default async (_ctx, options = {}) => {
         for (const m of pruned) {
           const role = m.info?.role || "unknown";
           const text = m.parts
-            .filter((p) => p.type === "text")
-            .map((p) => stripSystemReminderBlocks(p.text))
-            .filter((t) => t)
+            .flatMap((p) => {
+              if (p.type === "text") {
+                const value = stripSystemReminderBlocks(p.text);
+                return value ? [value] : [];
+              }
+              return [];
+            })
             .join("\n")
             .trim();
           if (!text) continue;
@@ -985,26 +1157,14 @@ export default async (_ctx, options = {}) => {
         const buildModel = resolveSummaryModel(configuredSummaryModel, messages);
         log(`Pruned count: ${pruned.length}. Running summarization with model ${buildModel.providerID}/${buildModel.modelID}...`);
 
-        let combinedTranscript = "";
-        if (sessionState.summary) {
-          combinedTranscript =
-`PREVIOUS SUMMARY:
-${sessionState.summary}
+        const combinedTranscript = `${buildHistoricalSummaryContext(summaryEntries)}
 
-NEW MESSAGES:
+NEW PRUNED MESSAGES:
 ${newTranscript}`;
-        } else {
-          combinedTranscript =
-`PREVIOUS SUMMARY:
-(none)
-
-NEW MESSAGES:
-${newTranscript}`;
-        }
 
         try {
-          summaryText = await summarizePrunedMessages(_ctx.client, combinedTranscript, buildModel, summaryMaxTokens, debug);
-          if (!summaryText || !summaryText.trim()) {
+          latestSummaryEntryText = await summarizePrunedMessages(_ctx.client, combinedTranscript, buildModel, summaryMaxTokens, debug);
+          if (!latestSummaryEntryText || !latestSummaryEntryText.trim()) {
             throw new Error("Empty summary text returned.");
           }
           nextFailureCount = 0;
@@ -1014,9 +1174,9 @@ ${newTranscript}`;
 ======================================================================
 ${combinedTranscript}
 ======================================================================
-[COMPACTARE CONTEXT] SUMAR REZULTAT:
+[COMPACTARE CONTEXT] SUMAR SEGMENT REZULTAT:
 ======================================================================
-${summaryText}
+${latestSummaryEntryText}
 ======================================================================
           `);
 
@@ -1026,7 +1186,8 @@ ${summaryText}
 
           const updatedSummarizedIDs = [...sessionState.summarizedIDs, ...newlySummarizedIDs];
           const nextContextLedger = buildContextLedger([...messages.slice(0, startIndex), ...kept]);
-          saveSessionState(sessionID, summaryText, updatedSummarizedIDs, nextFailureCount, nextContextLedger);
+          summaryEntries = appendSessionSummary(sessionID, latestSummaryEntryText, maxSummaryFiles);
+          saveSessionState(sessionID, "", updatedSummarizedIDs, nextFailureCount, nextContextLedger);
 
         } catch (err) {
           summaryError = err;
@@ -1034,7 +1195,7 @@ ${summaryText}
 
           if (!isHardLimitExceeded) {
             log(`Summarization execution failed: ${err.message}. Hard limit not exceeded (latestContextTokens=${latestContextTokens}, hardMaxTokens=${hardMaxTokens}); skipping prune and increasing summaryFailureCount to ${nextFailureCount}.`);
-            saveSessionState(sessionID, sessionState.summary, sessionState.summarizedIDs, nextFailureCount, buildContextLedger(messages));
+            saveSessionState(sessionID, "", sessionState.summarizedIDs, nextFailureCount, buildContextLedger(messages));
             return output;
           }
 
@@ -1045,16 +1206,18 @@ ${summaryText}
             .filter((id) => id);
           const updatedSummarizedIDs = [...sessionState.summarizedIDs, ...newlySummarizedIDs];
           const nextContextLedger = buildContextLedger([...messages.slice(0, startIndex), ...kept]);
-          saveSessionState(sessionID, sessionState.summary, updatedSummarizedIDs, nextFailureCount, nextContextLedger);
+          saveSessionState(sessionID, "", updatedSummarizedIDs, nextFailureCount, nextContextLedger);
         }
       }
 
       // Re-reconstruct messages array with updated summary at index 0 and kept messages.
       messages.length = 0;
 
-      if (summaryText) {
-        const summaryMessage = buildSummaryMessage(sessionID, summaryText);
-        messages.push(summaryMessage);
+      if (summaryEntries.length > 0) {
+        const summaryMessage = buildSummaryMessage(sessionID, summaryEntries);
+        if (summaryMessage) {
+          messages.push(summaryMessage);
+        }
       }
 
       messages.push(...kept);
