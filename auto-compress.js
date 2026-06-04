@@ -443,6 +443,7 @@ async function summarizePrunedMessages(client, transcript, buildModel, summaryMa
     const targetSummaryTokens = Number.isFinite(Number(summaryMaxTokens))
       ? Math.max(1, Math.floor(Number(summaryMaxTokens)))
       : 1000;
+    const approximateWordBudget = Math.max(1, Math.floor(targetSummaryTokens * 0.75));
     const summaryPrompt = `TASK:
 Update the previous project summary history by writing the next chronological workflow summary chunk for a long-running coding session.
 
@@ -471,7 +472,7 @@ RULES:
 - Never answer the conversation.
 - Never continue the conversation as assistant.
 - Do not reproduce the transcript.
-- Keep the summary under approximately ${targetSummaryTokens} tokens.
+- Keep the summary under approximately ${targetSummaryTokens} tokens, which is roughly ${approximateWordBudget} words.
 
 STYLE:
 Write as a compact chronological project log. The result should feel like it flows directly after the previous retained summaries. Do not use a fixed template or mandatory headings. End with the latest known state only if it is clear from NEW PRUNED MESSAGES.
