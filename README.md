@@ -27,18 +27,17 @@ Add to `~/.config/opencode/opencode.json`:
 [
   "file:///home/marius/.opencode/auto-compress.js",
   {
-    "maxContextTokens": 40000,
-    "minContextTokens": 20000,
-    "summaryMaxTokens": 6000,
-    "maxSummaryFiles": 5,
-    "tokenCoefficient": 3.5,
-    "model": "openai/gpt-5.4-mini",
+    "maxContextTokens": 100000,
+    "minContextTokens": 60000,
+    "summaryMaxTokens": 1000,
+    "maxSummaryFiles": 10,
+    "tokenCoefficient": 4,
+    "model": "opencode-go/mimo-v2.5",
     "stripReasoning": {
       "enable": true,
       "preserveLast": 5
     },
-    "debug": false,
-    "debugRequestPayload": false
+    "logLevel": "debug"
   }
 ]
 ```
@@ -49,19 +48,18 @@ If you enable integrated `stripReasoning`, remove the separate `strip-reasoning`
 
 | Option                           | Type    | Default | Practical Effect                                                                    |
 | -------------------------------- | ------- | -------:| ----------------------------------------------------------------------------------- |
-| `maxContextTokens`               | number  | `40000` | Compaction starts when estimated active provider-visible payload reaches this limit |
-| `minContextTokens`               | number  | `20000` | Target estimated token budget kept after compaction                                |
+| `maxContextTokens`               | number  | `100000` | Compaction starts when estimated active provider-visible payload reaches this limit |
+| `minContextTokens`               | number  | `60000` | Target estimated token budget kept after compaction                                |
 | `summaryMaxTokens`               | number  | `1000`  | Approximate summary budget requested from summarizer                                |
-| `maxSummaryFiles`                | number  | `5`     | Number of per-session summary chunks retained and injected back as historical context |
-| `tokenCoefficient`               | number  | `3.5`   | Character-to-token divisor used by the static estimator                             |
-| `model`                          | string  | active session model | Fixed summarizer model in `provider/model` format                     |
+| `maxSummaryFiles`                | number  | `10`    | Number of per-session summary chunks retained and injected back as historical context |
+| `tokenCoefficient`               | number  | `4`     | Character-to-token divisor used by the static estimator                             |
+| `model`                          | string  | `opencode-go/mimo-v2.5` | Fixed summarizer model in `provider/model` format                  |
 | `failureBackoffStepTokens`       | number  | `5000`  | Raises compaction trigger after each summary failure                                |
 | `failureBackoffMaxOffsetTokens`  | number  | `25000` | Caps the failure backoff offset applied to max/min token thresholds                 |
-| `stripReasoning.enable`          | boolean | `false` | Strips reasoning parts from the final request payload and from summary transcripts   |
-| `stripReasoning.preserveLast`    | number  | `1`     | Keeps the newest N reasoning parts in the payload and summary transcript             |
-| `debug`                          | boolean | `false` | Master file-debug switch; `false` disables log/debug file writes                    |
-| `debugRequestPayload`            | boolean | `false` | Logs summarization HTTP payload JSON; effective only when `debug: true`             |
-| `debugTokenCalc`                 | boolean | `false` | Writes detailed token estimator traces when `debug: true`                           |
+| `stripReasoning.enable`          | boolean | `true`  | Strips reasoning parts from the final request payload and from summary transcripts   |
+| `stripReasoning.preserveLast`    | number  | `5`     | Keeps the newest N reasoning parts in the payload and summary transcript             |
+| `logLevel`                       | string  | `debug` | `none` = silent, `error` = critical errors only, `debug` = file debug logs           |
+| `debugTokenCalc`                 | boolean | `false` | Writes detailed token estimator traces when `logLevel: debug`                        |
 
 Reasoning settings:
 
@@ -94,7 +92,7 @@ Cons:
 
 - If summaries look weak, verify active model quality and tune `summaryMaxTokens`.
 - If compaction feels too aggressive, raise `maxContextTokens` and/or `minContextTokens`.
-- If you want no disk debug artifacts, keep `debug: false`.
+- If you want no disk debug artifacts, keep `logLevel: none`.
 
 ## For LLM
 
@@ -137,8 +135,8 @@ Cons:
 | -------------------------------------------------------------------------- | -------------------------------------------------------- |
 | `~/.config/opencode/logs/auto-compress/state/<sessionID>.json`             | Persistent functional state (`summarizedIDs`, failure state, legacy migration slot) |
 | `~/.config/opencode/logs/auto-compress/summaries/<sessionID>/<NNNNNN>.md`  | Retained per-session summary chunks in chronological order |
-| `~/.config/opencode/logs/auto-compress/auto-compress.log`                  | Debug log when `debug: true`                             |
-| `~/.config/opencode/logs/auto-compress/prune-<sessionID>-<timestamp>.json` | Per-prune debug snapshots when `debug: true`             |
+| `~/.config/opencode/logs/auto-compress/auto-compress.log`                  | Debug log when `logLevel: debug`                         |
+| `~/.config/opencode/logs/auto-compress/prune-<sessionID>-<timestamp>.json` | Per-prune debug snapshots when `logLevel: debug`         |
 
 Retention policy:
 
@@ -148,7 +146,7 @@ Retention policy:
 
 - `state/*.json` is functional state, not disposable debug data.
 - `summaries/<sessionID>/*.md` is functional retained context, not disposable debug data.
-- `debug: false` must produce no file logging/debug snapshots.
+- `logLevel: none` must produce no file logging/debug snapshots.
 - Summarization uses the active session model.
 - Transcript must strip `<system-reminder>` blocks before summarization.
 - Provider-reported context tokens remain the only trigger for compaction thresholds and hard caps.

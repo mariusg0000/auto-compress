@@ -22,40 +22,14 @@ const DEBUG_DIR = join(homedir(), ".config", "opencode", "logs", "auto-compress"
 const LOG_FILE = join(DEBUG_DIR, "auto-compress.log");
 const TOKEN_LOG_FILE = join(DEBUG_DIR, "token-calc.log");
 const SUMMARY_DIR = join(DEBUG_DIR, "summaries");
-let fetchDebugInstalled = false;
-let debugEnabled = false;
+const LOG_LEVELS = new Set(["none", "error", "debug"]);
+let logLevel = "none";
 let tokenCalcDebugEnabled = false;
 let tokenCoefficient = DEFAULT_TOKEN_COEFFICIENT;
 
-function installRequestPayloadDebug(enabled) {
-  if (!enabled || fetchDebugInstalled || typeof globalThis.fetch !== "function") return;
-  const originalFetch = globalThis.fetch.bind(globalThis);
-  globalThis.fetch = async (input, init) => {
-    try {
-      const url = typeof input === "string" ? input : input?.url;
-      const bodyRaw = init?.body;
-      if (typeof bodyRaw === "string") {
-        const lowerUrl = String(url || "").toLowerCase();
-        const looksLikeLlm =
-          lowerUrl.includes("/chat/completions") ||
-          lowerUrl.includes("/responses") ||
-          lowerUrl.includes("/messages");
-        if (looksLikeLlm) {
-          const parsed = JSON.parse(bodyRaw);
-          const marker = JSON.stringify(parsed);
-          if (marker.includes("Update the previous project summary")) {
-            log(`[llm-payload] URL: ${url}`);
-            log(`[llm-payload] BODY: ${JSON.stringify(parsed)}`);
-          }
-        }
-      }
-    } catch (err) {
-      log(`[llm-payload] Debug wrapper error: ${err.message}`);
-    }
-    return originalFetch(input, init);
-  };
-  fetchDebugInstalled = true;
-  log("[llm-payload] Request payload debug wrapper installed.");
+function normalizeLogLevel(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return LOG_LEVELS.has(normalized) ? normalized : "none";
 }
 
 /**
@@ -77,7 +51,7 @@ function ensureDir() {
  * RETURNS: void
  */
 function log(msg) {
-  if (!debugEnabled) return;
+  if (logLevel !== "debug") return;
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   try {
     ensureDir();
@@ -93,12 +67,17 @@ function log(msg) {
  * RETURNS: void
  */
 function logTokenCalc(_msg) {
-  if (!tokenCalcDebugEnabled) return;
+  if (!tokenCalcDebugEnabled || logLevel !== "debug") return;
   const line = `[${new Date().toISOString()}] ${_msg}\n`;
   try {
     ensureDir();
     appendFileSync(TOKEN_LOG_FILE, line, "utf-8");
   } catch {}
+}
+
+function reportError(msg) {
+  if (logLevel === "none") return;
+  console.error(msg);
 }
 
 function stripSystemReminderBlocks(text) {
@@ -416,7 +395,7 @@ function getBuildModel() {
     const [providerID, modelID] = modelStr.split("/");
     return { providerID, modelID };
   } catch (e) {
-    log(`Failed to parse opencode.json config: ${e.message}. Using fallback deepseek-v4-flash.`);
+    reportError(`Failed to parse opencode.json config: ${e.message}. Using fallback deepseek-v4-flash.`);
     return { providerID: "opencode-go", modelID: "deepseek-v4-flash" };
   }
 }
@@ -655,7 +634,7 @@ ${transcript}`;
 
     return summaryText;
   } catch (err) {
-    log(`LLM summarization call failed: ${err.message}`);
+    reportError(`LLM summarization call failed: ${err.message}`);
     throw err;
   } finally {
     if (tempSession && tempSession.data?.id) {
@@ -1061,29 +1040,27 @@ export default async (_ctx, options = {}) => {
   const summaryMaxTokens = options.summaryMaxTokens ?? 1000;
   const configuredSummaryModel = options.model;
   const configuredTokenCoefficient = options.tokenCoefficient;
-  const debug = options.debug ?? false;
-  const debugRequestPayload = options.debugRequestPayload ?? false;
+  const logLevelInput = normalizeLogLevel(options.logLevel);
   const failureBackoffStepTokens = options.failureBackoffStepTokens ?? DEFAULT_FAILURE_BACKOFF_STEP_TOKENS;
   const failureBackoffMaxOffsetTokens = options.failureBackoffMaxOffsetTokens ?? DEFAULT_FAILURE_BACKOFF_MAX_OFFSET_TOKENS;
   const debugTokenCalc = options.debugTokenCalc ?? false;
   const maxSummaryFiles = options.maxSummaryFiles ?? DEFAULT_MAX_SUMMARY_FILES;
   const stripReasoningOptions = normalizeStripReasoningOptions(options);
 
-  debugEnabled = Boolean(debug);
-  tokenCalcDebugEnabled = Boolean(debug) && Boolean(debugTokenCalc);
+  logLevel = logLevelInput;
+  tokenCalcDebugEnabled = logLevel === "debug" && Boolean(debugTokenCalc);
   tokenCoefficient = Number.isFinite(Number(configuredTokenCoefficient)) && Number(configuredTokenCoefficient) > 0
     ? Number(configuredTokenCoefficient)
     : DEFAULT_TOKEN_COEFFICIENT;
 
-  if (debugEnabled) {
+  if (logLevel === "debug") {
     log("MODULE LOADED");
   }
 
-  installRequestPayloadDebug(debugEnabled && debugRequestPayload);
   cleanupOldStateFiles(30);
   cleanupOldSummaryDirectories(30);
 
-  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextTokens=${maxTokens}, minContextTokens=${minTokens}, summaryMaxTokens=${summaryMaxTokens}, tokenCoefficient=${tokenCoefficient}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}, failureBackoffStepTokens=${failureBackoffStepTokens}, failureBackoffMaxOffsetTokens=${failureBackoffMaxOffsetTokens}, maxSummaryFiles=${maxSummaryFiles}, stripReasoning=${stripReasoningOptions.enabled}, preserveLastReasoning=${stripReasoningOptions.preserveLast}`);
+  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== providerContextLimits maxContextTokens=${maxTokens}, minContextTokens=${minTokens}`);
 
   return {
     "experimental.chat.messages.transform": async (_input, output) => {
@@ -1156,8 +1133,8 @@ export default async (_ctx, options = {}) => {
       const latestUsage = usageRecords.length > 0 ? usageRecords[usageRecords.length - 1] : null;
       const latestContextTokens = latestUsage?.contextTokens || 0;
 
-      log(`[hook] Reconstructed messages=${messages.length}, latestContextTokens=${latestContextTokens}, maxContextTokens=${sanitizedMaxTokens}, effectiveMaxTokens=${effectiveMaxTokens}, hardMaxTokens=${hardMaxTokens}, minContextTokens=${sanitizedMinTokens}, hardMinTokens=${hardMinTokens}, summaryFailureCount=${failureCount}, currentBackoffOffset=${currentBackoffOffset}`);
-      logTokenCalc(`[transform:reconstructed] latestContextTokens=${latestContextTokens} maxContextTokens=${sanitizedMaxTokens} effectiveMaxTokens=${effectiveMaxTokens} hardMaxTokens=${hardMaxTokens} minContextTokens=${sanitizedMinTokens} hardMinTokens=${hardMinTokens} summaryFailureCount=${failureCount} currentBackoffOffset=${currentBackoffOffset}`);
+      log(`[hook] providerContextTokens=${latestContextTokens}, maxContextTokens=${sanitizedMaxTokens}, effectiveMaxTokens=${effectiveMaxTokens}, hardMaxTokens=${hardMaxTokens}, minContextTokens=${sanitizedMinTokens}, hardMinTokens=${hardMinTokens}`);
+      logTokenCalc(`[transform:reconstructed] providerContextTokens=${latestContextTokens} maxContextTokens=${sanitizedMaxTokens} effectiveMaxTokens=${effectiveMaxTokens} hardMaxTokens=${hardMaxTokens} minContextTokens=${sanitizedMinTokens} hardMinTokens=${hardMinTokens}`);
 
       if (latestContextTokens < effectiveMaxTokens) {
         log("[hook] Below effectiveMaxTokens, returning reconstructed context.");
@@ -1217,7 +1194,6 @@ export default async (_ctx, options = {}) => {
 
       const beforeTokens = latestContextTokens;
       const activeBeforeCount = messages.length - startIndex;
-      const activeMessageTokens = sumMessageTokens(messages, startIndex, stripReasoningOptions, indexedReasoningKeepSet);
       
       let latestSummaryEntryText = summaryEntries.length > 0 ? summaryEntries[summaryEntries.length - 1].text : "";
       let summaryError = null;
@@ -1259,7 +1235,7 @@ NEW PRUNED MESSAGES:
 ${newTranscript}`;
 
         try {
-          latestSummaryEntryText = await summarizePrunedMessages(_ctx.client, combinedTranscript, buildModel, summaryMaxTokens, debug);
+          latestSummaryEntryText = await summarizePrunedMessages(_ctx.client, combinedTranscript, buildModel, summaryMaxTokens, logLevel === "debug");
           if (!latestSummaryEntryText || !latestSummaryEntryText.trim()) {
             throw new Error("Empty summary text returned.");
           }
@@ -1320,22 +1296,19 @@ ${latestSummaryEntryText}
 
       applyReasoningStripInPlace(messages, stripReasoningOptions);
 
-      const afterActiveTokens = messages
-        .filter((m) => !m.info?.synthetic)
-        .reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
       const afterTotalTokens = messages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
       const afterLatestUsage = buildAssistantUsageRecords(messages).at(-1) || null;
       const afterLatestContextTokens = afterLatestUsage?.contextTokens || 0;
       const removedIndices = [];
       for (let i = startIndex; i < cutIndex; i++) removedIndices.push(i);
 
-      log(`pruned: ${pruned.length} messages. Remaining active messages: ${messages.length}. activeMessageTokens=${afterActiveTokens} latestContextTokens=${afterLatestContextTokens} totalTokens=${afterTotalTokens}`);
-      logTokenCalc(`[transform:final] pruned=${pruned.length} remainingMessages=${messages.length} activeMessageTokens=${afterActiveTokens} latestContextTokens=${afterLatestContextTokens} totalTokens=${afterTotalTokens}`);
+      log(`[hook] providerContextTokens=${afterLatestContextTokens}, maxContextTokens=${sanitizedMaxTokens}, effectiveMaxTokens=${effectiveMaxTokens}, hardMaxTokens=${hardMaxTokens}, minContextTokens=${sanitizedMinTokens}, hardMinTokens=${hardMinTokens}`);
+      logTokenCalc(`[transform:final] providerContextTokens=${afterLatestContextTokens} maxContextTokens=${sanitizedMaxTokens} effectiveMaxTokens=${effectiveMaxTokens} hardMaxTokens=${hardMaxTokens} minContextTokens=${sanitizedMinTokens} hardMinTokens=${hardMinTokens}`);
 
-      writeDebugLog(debug, sessionID, activeBeforeCount, beforeTokens, messages.length, afterTotalTokens, removedIndices, messages);
+      writeDebugLog(logLevel === "debug", sessionID, activeBeforeCount, beforeTokens, messages.length, afterTotalTokens, removedIndices, messages);
 
       if (summaryError) {
-        console.error(`[auto-compress] Summarization failed; context was still pruned: ${summaryError.message}`);
+        reportError(`[auto-compress] Summarization failed; context was still pruned: ${summaryError.message}`);
       }
 
       return finalizeOutputWithReasoningStrip(output, stripReasoningOptions);
