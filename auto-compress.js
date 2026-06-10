@@ -189,6 +189,70 @@ function countTextTokens(text) {
   return tokenizeText(text);
 }
 
+function normalizeStripReasoningOptions(options = {}) {
+  const stripReasoning = options?.stripReasoning;
+  const enabled = Boolean(stripReasoning?.enable);
+  const preserveLastRaw = stripReasoning?.preserveLast ?? 1;
+  const preserveLast = Number.isFinite(Number(preserveLastRaw))
+    ? Math.max(0, Math.floor(Number(preserveLastRaw)))
+    : 1;
+
+  return {
+    enabled,
+    preserveLast,
+  };
+}
+
+function getReasoningPartKey(messageIndex, partIndex) {
+  return `${messageIndex}:${partIndex}`;
+}
+
+function collectReasoningKeepSet(messages, preserveLast) {
+  const keepSet = new Set();
+  if (!Array.isArray(messages) || preserveLast <= 0) return keepSet;
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0 && keepSet.size < preserveLast; messageIndex--) {
+    const parts = Array.isArray(messages[messageIndex]?.parts) ? messages[messageIndex].parts : [];
+    for (let partIndex = parts.length - 1; partIndex >= 0 && keepSet.size < preserveLast; partIndex--) {
+      if (parts[partIndex]?.type === "reasoning") {
+        keepSet.add(getReasoningPartKey(messageIndex, partIndex));
+      }
+    }
+  }
+
+  return keepSet;
+}
+
+function shouldKeepReasoningPart(part, messageIndex, partIndex, stripReasoningOptions, reasoningKeepSet) {
+  if (part?.type !== "reasoning") return true;
+  if (!stripReasoningOptions?.enabled) return true;
+  return reasoningKeepSet.has(getReasoningPartKey(messageIndex, partIndex));
+}
+
+function applyReasoningStripInPlace(messages, stripReasoningOptions) {
+  if (!Array.isArray(messages) || !stripReasoningOptions?.enabled) return messages;
+
+  const reasoningKeepSet = collectReasoningKeepSet(messages, stripReasoningOptions.preserveLast);
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+    const message = messages[messageIndex];
+    if (!Array.isArray(message?.parts)) continue;
+    message.parts = message.parts.map((part, partIndex) => {
+      if (shouldKeepReasoningPart(part, messageIndex, partIndex, stripReasoningOptions, reasoningKeepSet)) {
+        return part;
+      }
+      return { type: "text", text: "" };
+    });
+  }
+
+  return messages;
+}
+
+function finalizeOutputWithReasoningStrip(output, stripReasoningOptions) {
+  if (!output?.messages || !stripReasoningOptions?.enabled) return output;
+  applyReasoningStripInPlace(output.messages, stripReasoningOptions);
+  return output;
+}
+
 function getAssistantPromptTokens(message) {
   if (message?.info?.role !== "assistant") return null;
   const tokens = message?.info?.tokens;
@@ -234,18 +298,21 @@ function buildAssistantUsageRecords(messages) {
   return records;
 }
 
-function sumMessageTokens(messages, startIndex = 0) {
-  return messages.slice(startIndex).reduce((s, m, messageIndex) => s + sumTokens(m, startIndex + messageIndex), 0);
+function sumMessageTokens(messages, startIndex = 0, stripReasoningOptions = null, reasoningKeepSet = new Set()) {
+  return messages.slice(startIndex).reduce(
+    (s, m, messageIndex) => s + sumTokens(m, startIndex + messageIndex, stripReasoningOptions, reasoningKeepSet),
+    0,
+  );
 }
 
-function findCutIndexByEstimatedTokens(messages, startIndex, targetRetainedTokens) {
+function findCutIndexByEstimatedTokens(messages, startIndex, targetRetainedTokens, stripReasoningOptions = null, reasoningKeepSet = new Set()) {
   if (!Array.isArray(messages) || messages.length === 0) return -1;
 
   let keptTokens = 0;
   let chosenIndex = -1;
 
   for (let i = messages.length - 1; i >= startIndex; i--) {
-    keptTokens += sumTokens(messages[i], i);
+    keptTokens += sumTokens(messages[i], i, stripReasoningOptions, reasoningKeepSet);
     if (keptTokens >= targetRetainedTokens) {
       chosenIndex = i;
       break;
@@ -610,7 +677,7 @@ ${transcript}`;
  * PARAMS:  msg: object — The message structure with parts.
  * RETURNS: number — Estimated token count.
  */
-function sumTokens(msg, messageIndex = -1) {
+function sumTokens(msg, messageIndex = -1, stripReasoningOptions = null, reasoningKeepSet = new Set()) {
   let s = 0;
   const messageID = msg?.info?.id || "unknown";
   const role = msg?.info?.role || "unknown";
@@ -623,6 +690,10 @@ function sumTokens(msg, messageIndex = -1) {
       logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=text chars=${(p.text || "").length} tokens=${tokens}`);
     }
     else if (p.type === "reasoning") {
+      if (!shouldKeepReasoningPart(p, messageIndex, partIndex, stripReasoningOptions, reasoningKeepSet)) {
+        logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=reasoning chars=${(p.text || "").length} tokens=0 source=reasoning-text reason=stripped`);
+        continue;
+      }
       const tokens = countTextTokens(p.text || "");
       s += tokens;
       logTokenCalc(`[part] messageIndex=${messageIndex} partIndex=${partIndex} type=reasoning chars=${(p.text || "").length} tokens=${tokens} source=reasoning-text`);
@@ -996,6 +1067,7 @@ export default async (_ctx, options = {}) => {
   const failureBackoffMaxOffsetTokens = options.failureBackoffMaxOffsetTokens ?? DEFAULT_FAILURE_BACKOFF_MAX_OFFSET_TOKENS;
   const debugTokenCalc = options.debugTokenCalc ?? false;
   const maxSummaryFiles = options.maxSummaryFiles ?? DEFAULT_MAX_SUMMARY_FILES;
+  const stripReasoningOptions = normalizeStripReasoningOptions(options);
 
   debugEnabled = Boolean(debug);
   tokenCalcDebugEnabled = Boolean(debug) && Boolean(debugTokenCalc);
@@ -1011,7 +1083,7 @@ export default async (_ctx, options = {}) => {
   cleanupOldStateFiles(30);
   cleanupOldSummaryDirectories(30);
 
-  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextTokens=${maxTokens}, minContextTokens=${minTokens}, summaryMaxTokens=${summaryMaxTokens}, tokenCoefficient=${tokenCoefficient}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}, failureBackoffStepTokens=${failureBackoffStepTokens}, failureBackoffMaxOffsetTokens=${failureBackoffMaxOffsetTokens}, maxSummaryFiles=${maxSummaryFiles}`);
+  log(`===== PLUGIN EXPORT DEFAULT CALLED ===== maxContextTokens=${maxTokens}, minContextTokens=${minTokens}, summaryMaxTokens=${summaryMaxTokens}, tokenCoefficient=${tokenCoefficient}, debug=${debug}, debugRequestPayload=${debugRequestPayload}, debugTokenCalc=${debugTokenCalc}, failureBackoffStepTokens=${failureBackoffStepTokens}, failureBackoffMaxOffsetTokens=${failureBackoffMaxOffsetTokens}, maxSummaryFiles=${maxSummaryFiles}, stripReasoning=${stripReasoningOptions.enabled}, preserveLastReasoning=${stripReasoningOptions.preserveLast}`);
 
   return {
     "experimental.chat.messages.transform": async (_input, output) => {
@@ -1080,19 +1152,16 @@ export default async (_ctx, options = {}) => {
         logTokenCalc(`[transform:start] sessionID=${sessionID} messages=${messages.length}`);
       }
 
-      const activeMessages = messages.filter((m) => !m.info?.synthetic);
-      const activeCount = activeMessages.length;
-      const activeMessageTokens = activeMessages.reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
       const usageRecords = buildAssistantUsageRecords(messages);
       const latestUsage = usageRecords.length > 0 ? usageRecords[usageRecords.length - 1] : null;
       const latestContextTokens = latestUsage?.contextTokens || 0;
 
-      log(`[hook] Reconstructed messages=${messages.length}, activeMessages=${activeCount}, activeMessageTokens=${activeMessageTokens}, latestContextTokens=${latestContextTokens}, maxContextTokens=${sanitizedMaxTokens}, effectiveMaxTokens=${effectiveMaxTokens}, hardMaxTokens=${hardMaxTokens}, minContextTokens=${sanitizedMinTokens}, hardMinTokens=${hardMinTokens}, summaryFailureCount=${failureCount}, currentBackoffOffset=${currentBackoffOffset}`);
-      logTokenCalc(`[transform:reconstructed] activeMessages=${activeCount} activeMessageTokens=${activeMessageTokens} latestContextTokens=${latestContextTokens} maxContextTokens=${sanitizedMaxTokens} effectiveMaxTokens=${effectiveMaxTokens} hardMaxTokens=${hardMaxTokens} minContextTokens=${sanitizedMinTokens} hardMinTokens=${hardMinTokens} summaryFailureCount=${failureCount} currentBackoffOffset=${currentBackoffOffset}`);
+      log(`[hook] Reconstructed messages=${messages.length}, latestContextTokens=${latestContextTokens}, maxContextTokens=${sanitizedMaxTokens}, effectiveMaxTokens=${effectiveMaxTokens}, hardMaxTokens=${hardMaxTokens}, minContextTokens=${sanitizedMinTokens}, hardMinTokens=${hardMinTokens}, summaryFailureCount=${failureCount}, currentBackoffOffset=${currentBackoffOffset}`);
+      logTokenCalc(`[transform:reconstructed] latestContextTokens=${latestContextTokens} maxContextTokens=${sanitizedMaxTokens} effectiveMaxTokens=${effectiveMaxTokens} hardMaxTokens=${hardMaxTokens} minContextTokens=${sanitizedMinTokens} hardMinTokens=${hardMinTokens} summaryFailureCount=${failureCount} currentBackoffOffset=${currentBackoffOffset}`);
 
       if (latestContextTokens < effectiveMaxTokens) {
         log("[hook] Below effectiveMaxTokens, returning reconstructed context.");
-        return output;
+        return finalizeOutputWithReasoningStrip(output, stripReasoningOptions);
       }
 
       // Re-map tool call indexes on the active messages.
@@ -1109,11 +1178,25 @@ export default async (_ctx, options = {}) => {
       const startIndex = (messages[0]?.info?.synthetic) ? 1 : 0;
       const isHardLimitExceeded = latestContextTokens > hardMaxTokens;
       const targetRetainedTokens = isHardLimitExceeded ? hardMinTokens : sanitizedMinTokens;
-      let cutIndex = findCutIndexByEstimatedTokens(messages, startIndex, targetRetainedTokens);
+      const activeMessages = messages.slice(startIndex);
+      const reasoningKeepSet = collectReasoningKeepSet(activeMessages, stripReasoningOptions.enabled ? stripReasoningOptions.preserveLast : Number.MAX_SAFE_INTEGER);
+      const indexedReasoningKeepSet = new Set(
+        Array.from(reasoningKeepSet, (key) => {
+          const [messageIndexRaw, partIndexRaw] = key.split(":");
+          return getReasoningPartKey(startIndex + Number(messageIndexRaw), Number(partIndexRaw));
+        }),
+      );
+      let cutIndex = findCutIndexByEstimatedTokens(
+        messages,
+        startIndex,
+        targetRetainedTokens,
+        stripReasoningOptions,
+        indexedReasoningKeepSet,
+      );
 
       if (cutIndex <= startIndex) {
         log(`[hook] cutIndex (${cutIndex}) <= startIndex (${startIndex}), nothing to prune.`);
-        return output;
+        return finalizeOutputWithReasoningStrip(output, stripReasoningOptions);
       }
 
       const pruned = messages.slice(startIndex, cutIndex);
@@ -1134,21 +1217,27 @@ export default async (_ctx, options = {}) => {
 
       const beforeTokens = latestContextTokens;
       const activeBeforeCount = messages.length - startIndex;
+      const activeMessageTokens = sumMessageTokens(messages, startIndex, stripReasoningOptions, indexedReasoningKeepSet);
       
       let latestSummaryEntryText = summaryEntries.length > 0 ? summaryEntries[summaryEntries.length - 1].text : "";
       let summaryError = null;
       let nextFailureCount = failureCount;
       if (pruned.length > 0) {
+        const prunedReasoningKeepSet = collectReasoningKeepSet(pruned, stripReasoningOptions.enabled ? stripReasoningOptions.preserveLast : Number.MAX_SAFE_INTEGER);
         const newTranscriptLines = [];
-        for (const m of pruned) {
+        for (let messageIndex = 0; messageIndex < pruned.length; messageIndex++) {
+          const m = pruned[messageIndex];
           const role = m.info?.role || "unknown";
           const text = m.parts
-            .flatMap((p) => {
+            .flatMap((p, partIndex) => {
               if (p.type === "text") {
                 const value = stripSystemReminderBlocks(p.text);
                 return value ? [value] : [];
               }
               if (p.type === "reasoning") {
+                if (!shouldKeepReasoningPart(p, messageIndex, partIndex, stripReasoningOptions, prunedReasoningKeepSet)) {
+                  return [];
+                }
                 const value = stripSystemReminderBlocks(p.text);
                 return value ? [`[REASONING]\n${value}\n[/REASONING]`] : [];
               }
@@ -1203,7 +1292,7 @@ ${latestSummaryEntryText}
           if (!isHardLimitExceeded) {
             log(`Summarization execution failed: ${err.message}. Hard limit not exceeded (latestContextTokens=${latestContextTokens}, hardMaxTokens=${hardMaxTokens}); skipping prune and increasing summaryFailureCount to ${nextFailureCount}.`);
             saveSessionState(sessionID, "", sessionState.summarizedIDs, nextFailureCount, buildContextLedger(messages));
-            return output;
+            return finalizeOutputWithReasoningStrip(output, stripReasoningOptions);
           }
 
           log(`Summarization execution failed: ${err.message}. Hard limit exceeded (latestContextTokens=${latestContextTokens}, hardMaxTokens=${hardMaxTokens}); forcing prune to hardMinTokens=${hardMinTokens} and increasing summaryFailureCount to ${nextFailureCount}.`);
@@ -1229,6 +1318,8 @@ ${latestSummaryEntryText}
 
       messages.push(...kept);
 
+      applyReasoningStripInPlace(messages, stripReasoningOptions);
+
       const afterActiveTokens = messages
         .filter((m) => !m.info?.synthetic)
         .reduce((s, m, messageIndex) => s + sumTokens(m, messageIndex), 0);
@@ -1247,7 +1338,7 @@ ${latestSummaryEntryText}
         console.error(`[auto-compress] Summarization failed; context was still pruned: ${summaryError.message}`);
       }
 
-      return output;
+      return finalizeOutputWithReasoningStrip(output, stripReasoningOptions);
     },
   };
 };

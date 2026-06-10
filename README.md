@@ -33,11 +33,17 @@ Add to `~/.config/opencode/opencode.json`:
     "maxSummaryFiles": 5,
     "tokenCoefficient": 3.5,
     "model": "openai/gpt-5.4-mini",
+    "stripReasoning": {
+      "enable": true,
+      "preserveLast": 5
+    },
     "debug": false,
     "debugRequestPayload": false
   }
 ]
 ```
+
+If you enable integrated `stripReasoning`, remove the separate `strip-reasoning` plugin from the same OpenCode config.
 
 ### Configuration
 
@@ -51,9 +57,16 @@ Add to `~/.config/opencode/opencode.json`:
 | `model`                          | string  | active session model | Fixed summarizer model in `provider/model` format                     |
 | `failureBackoffStepTokens`       | number  | `5000`  | Raises compaction trigger after each summary failure                                |
 | `failureBackoffMaxOffsetTokens`  | number  | `25000` | Caps the failure backoff offset applied to max/min token thresholds                 |
+| `stripReasoning.enable`          | boolean | `false` | Strips reasoning parts from the final request payload and from summary transcripts   |
+| `stripReasoning.preserveLast`    | number  | `1`     | Keeps the newest N reasoning parts in the payload and summary transcript             |
 | `debug`                          | boolean | `false` | Master file-debug switch; `false` disables log/debug file writes                    |
 | `debugRequestPayload`            | boolean | `false` | Logs summarization HTTP payload JSON; effective only when `debug: true`             |
 | `debugTokenCalc`                 | boolean | `false` | Writes detailed token estimator traces when `debug: true`                           |
+
+Reasoning settings:
+
+- `stripReasoning.preserveLast` counts reasoning parts globally across the assembled payload, not per message.
+- `stripReasoning.enable: true` keeps provider token thresholds unchanged; it only affects local cut-point estimation, summary transcript reasoning inclusion, and the final returned payload.
 
 ### Recommended Settings
 
@@ -95,21 +108,23 @@ Cons:
 ### OpenCode Hook Position
 
 - Runs in plugin order from `opencode.json`.
-- Reasoning stripping is handled by a separate plugin when desired.
+- Integrated reasoning stripping is available via `stripReasoning` options.
+- Do not run the separate `strip-reasoning` plugin together with this integrated mode.
 
 ### Runtime Flow
 
 1. Load state from `~/.config/opencode/logs/auto-compress/state/<sessionID>.json`.
 2. Reconstruct message list by removing already summarized IDs and old synthetic summary marker.
-3. Estimate active provider-visible tokens from text parts plus compact tool title/output/error text.
-4. If active token estimate is below `maxContextTokens`, return reconstructed messages.
-5. If the estimate reaches threshold, compute prune cut so only about `minContextTokens` of newest active content remains.
+3. Read the latest provider-reported prompt context tokens from the newest assistant usage record.
+4. If provider-reported context is below `maxContextTokens`, return reconstructed messages after optional reasoning strip.
+5. If provider-reported context reaches threshold, compute prune cut with the local estimator so only about `minContextTokens` of newest retained content remains.
 6. Extend cut when needed to avoid splitting tool-use/result semantics.
 8. Build transcript from pruned messages:
-   - include text parts,
-   - include compact tool title/output/error text,
-   - remove `<system-reminder>...</system-reminder>` blocks,
-   - skip empty lines/messages.
+    - include text parts,
+    - include only the newest configured reasoning parts as `[REASONING]` blocks,
+    - include compact tool title/output/error text,
+    - remove `<system-reminder>...</system-reminder>` blocks,
+    - skip empty lines/messages.
 9. Load the retained per-session summary chunks for historical continuity.
 10. Summarize the newly pruned segment using temporary session and `promptAsync` with `agent: "compaction"`.
 11. Save the new summary as `summaries/<sessionID>/<sequence>.md`, then trim older chunks beyond `maxSummaryFiles`.
@@ -136,6 +151,8 @@ Retention policy:
 - `debug: false` must produce no file logging/debug snapshots.
 - Summarization uses the active session model.
 - Transcript must strip `<system-reminder>` blocks before summarization.
+- Provider-reported context tokens remain the only trigger for compaction thresholds and hard caps.
+- When `stripReasoning.enable: true`, reasoning strip is applied only at final payload return and inside summary transcript construction.
 
 ### Edge Cases
 
