@@ -1,34 +1,33 @@
 # Active Task
 
 ## Goal
-Fix compaction cut-point selection so pruning keeps the estimator-selected boundary instead of rolling back to the chosen message parent.
+Update README.md and specs.md so they match the current plugin defaults, debug controls, and prune cut-point behavior, then commit and push the documentation changes.
 
 ## Constraints
-- Keep the existing tool call / tool response safety behavior.
-- Avoid unrelated prune logic changes.
+- Keep documentation changes scoped to current behavior only.
+- Do not change plugin runtime behavior in this task.
 
 ## Steps
-- [x] Diagnose why compaction returned `nothing to prune` above the hard cap.
-- [x] Confirm whether the estimator or parent-boundary adjustment caused the bad cut point.
-- [x] Update cut-point selection to keep the estimator-selected boundary.
-- [x] Validate the plugin syntax and confirm pruning resumes.
+- [x] Update README.md defaults and behavior notes.
+- [x] Update specs.md to match current configuration and cut-point behavior.
+- [x] Validate the documentation diff for accuracy.
+- [ ] Commit and push the approved documentation changes.
 
 ## Subtasks
-- [x] Add temporary diagnostics for estimator and cut-point inspection.
-- [x] Reproduce the bad `cutIndex <= startIndex` behavior from logs.
-- [x] Remove the generic `parentID` rollback from `findCutIndexByEstimatedTokens()`.
-- [x] Remove temporary diagnostics after verification.
+- [x] Fix stale install/config examples in README.md.
+- [x] Fix stale defaults and runtime flow text in README.md.
+- [x] Replace stale debug terminology in specs.md.
+- [x] Add current cut-point behavior to specs.md.
 
 ## Implementation Decisions
-- The estimator was not undercounting in the failing session; it selected `chosenIndex=26` while the generic `parentID` rollback collapsed the final cut point to `startIndex=1`.
-- The fix keeps `chosenIndex` directly and relies on the existing downstream tool result boundary extension to avoid splitting tool call / tool response pairs.
+- README.md now documents the plugin as an `opencode.json` plugin entry instead of a bare JSON array, because the previous example could be copied into an invalid config.
+- Documentation now distinguishes configured examples from code defaults so the README reflects actual runtime fallback values and threshold behavior.
 
 ## Validation Plan
-- [x] Run `node --check auto-compress.js`.
-- [x] Reproduce the failing session and confirm pruning/summarization executes.
+- [x] Review the final diffs against current code paths in auto-compress.js.
 
 ## Validation Results
-`node --check auto-compress.js` passed. Runtime logs confirmed the estimator selected `chosenIndex=26`, pruning removed 25 messages, summarization ran successfully, and session state was updated.
+Reviewed the README.md and specs.md diffs against `auto-compress.js` defaults, threshold handling, summary-model resolution, debug controls, and cut-point logic.
 
 ## Status
-Completed
+Active

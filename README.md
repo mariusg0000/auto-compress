@@ -24,22 +24,27 @@ Do not use it if you prefer fully raw transcript fidelity at all times and can t
 Add to `~/.config/opencode/opencode.json`:
 
 ```json
-[
-  "file:///home/marius/.opencode/auto-compress.js",
-  {
-    "maxContextTokens": 100000,
-    "minContextTokens": 60000,
-    "summaryMaxTokens": 1000,
-    "maxSummaryFiles": 10,
-    "tokenCoefficient": 4,
-    "model": "opencode-go/mimo-v2.5",
-    "stripReasoning": {
-      "enable": true,
-      "preserveLast": 5
-    },
-    "logLevel": "debug"
-  }
-]
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "file:///home/marius/.opencode/auto-compress.js",
+      {
+        "maxContextTokens": 100000,
+        "minContextTokens": 60000,
+        "summaryMaxTokens": 1000,
+        "maxSummaryFiles": 10,
+        "tokenCoefficient": 4,
+        "model": "opencode-go/mimo-v2.5",
+        "stripReasoning": {
+          "enable": true,
+          "preserveLast": 5
+        },
+        "logLevel": "debug"
+      }
+    ]
+  ]
+}
 ```
 
 If you enable integrated `stripReasoning`, remove the separate `strip-reasoning` plugin from the same OpenCode config.
@@ -48,17 +53,17 @@ If you enable integrated `stripReasoning`, remove the separate `strip-reasoning`
 
 | Option                           | Type    | Default | Practical Effect                                                                    |
 | -------------------------------- | ------- | -------:| ----------------------------------------------------------------------------------- |
-| `maxContextTokens`               | number  | `100000` | Compaction starts when estimated active provider-visible payload reaches this limit |
-| `minContextTokens`               | number  | `60000` | Target estimated token budget kept after compaction                                |
+| `maxContextTokens`               | number  | `40000` | Base provider-reported context threshold that starts compaction before any failure backoff |
+| `minContextTokens`               | number  | `20000` | Base estimated retained-token target after compaction before any hard-cap backoff   |
 | `summaryMaxTokens`               | number  | `1000`  | Approximate summary budget requested from summarizer                                |
-| `maxSummaryFiles`                | number  | `10`    | Number of per-session summary chunks retained and injected back as historical context |
-| `tokenCoefficient`               | number  | `4`     | Character-to-token divisor used by the static estimator                             |
-| `model`                          | string  | `opencode-go/mimo-v2.5` | Fixed summarizer model in `provider/model` format                  |
+| `maxSummaryFiles`                | number  | `5`     | Number of per-session summary chunks retained and injected back as historical context |
+| `tokenCoefficient`               | number  | `3.5`   | Character-to-token divisor used by the static estimator                             |
+| `model`                          | string  | active session model | Optional fixed summarizer model in `provider/model` format          |
 | `failureBackoffStepTokens`       | number  | `5000`  | Raises compaction trigger after each summary failure                                |
 | `failureBackoffMaxOffsetTokens`  | number  | `25000` | Caps the failure backoff offset applied to max/min token thresholds                 |
 | `stripReasoning.enable`          | boolean | `true`  | Strips reasoning parts from the final request payload and from summary transcripts   |
-| `stripReasoning.preserveLast`    | number  | `5`     | Keeps the newest N reasoning parts in the payload and summary transcript             |
-| `logLevel`                       | string  | `debug` | `none` = silent, `error` = critical errors only, `debug` = file debug logs           |
+| `stripReasoning.preserveLast`    | number  | `1`     | Keeps the newest N reasoning parts in the payload and summary transcript             |
+| `logLevel`                       | string  | `none`  | `none` = silent, `error` = critical errors only, `debug` = file debug logs           |
 | `debugTokenCalc`                 | boolean | `false` | Writes detailed token estimator traces when `logLevel: debug`                        |
 
 Reasoning settings:
@@ -114,8 +119,8 @@ Cons:
 1. Load state from `~/.config/opencode/logs/auto-compress/state/<sessionID>.json`.
 2. Reconstruct message list by removing already summarized IDs and old synthetic summary marker.
 3. Read the latest provider-reported prompt context tokens from the newest assistant usage record.
-4. If provider-reported context is below `maxContextTokens`, return reconstructed messages after optional reasoning strip.
-5. If provider-reported context reaches threshold, compute prune cut with the local estimator so only about `minContextTokens` of newest retained content remains.
+4. If provider-reported context is below the current `effectiveMaxTokens`, return reconstructed messages after optional reasoning strip.
+5. If provider-reported context reaches threshold, compute prune cut with the local estimator so only about `minContextTokens` of newest retained content remains, or `hardMinTokens` when already above the hard cap.
 6. Extend cut when needed to avoid splitting tool-use/result semantics.
 8. Build transcript from pruned messages:
     - include text parts,
@@ -147,7 +152,7 @@ Retention policy:
 - `state/*.json` is functional state, not disposable debug data.
 - `summaries/<sessionID>/*.md` is functional retained context, not disposable debug data.
 - `logLevel: none` must produce no file logging/debug snapshots.
-- Summarization uses the active session model.
+- Summarization uses the configured `model` when provided, otherwise the active session model.
 - Transcript must strip `<system-reminder>` blocks before summarization.
 - Provider-reported context tokens remain the only trigger for compaction thresholds and hard caps.
 - When `stripReasoning.enable: true`, reasoning strip is applied only at final payload return and inside summary transcript construction.
@@ -156,6 +161,7 @@ Retention policy:
 
 - If summarization fails below the hard token cap, plugin skips prune and increases the failure backoff.
 - If summarization fails above the hard token cap, plugin still prunes and surfaces runtime failure via UI error path.
+- Prune cut-point selection keeps the estimator-selected boundary; only tool-use/result safety can extend it further.
 - Status polling includes fallback message checks when idle state is not returned promptly.
 - Temporary summarization session cleanup is attempted in `finally`.
 
@@ -175,4 +181,4 @@ Retention policy:
 
 ## Version
 
-Last modified: 2026-05-24
+Last modified: 2026-06-12

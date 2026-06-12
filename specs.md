@@ -14,6 +14,7 @@
 - It does not mutate historical chat DB records.
 - Already-summarized message IDs and synthetic summary messages are filtered out before rebuilding the request payload.
 - Optional integrated `stripReasoning` behavior strips reasoning only on the returned payload and on summary-transcript inclusion, not on persisted history.
+- Prune cut-point selection now keeps the estimator-selected boundary instead of rolling back generically to the chosen message parent.
 
 ### Repository Map
 - `auto-compress.js`: main plugin entrypoint, token estimation, pruning, summarization, persistence, and cleanup.
@@ -26,11 +27,11 @@
 - Debug log files: `auto-compress.log`, `token-calc.log`, and prune snapshots under the same log root.
 - State includes `summarizedIDs`, `summaryFailureCount`, and `contextLedger`.
 - Legacy rolling `summary` is migrated into per-session summary chunks when present.
-- Summary generation can use a configured model via `options.model`; token estimation uses a configurable `tokenCoefficient`.
+- Summary generation can use a configured model via `options.model`; otherwise it falls back to the active session model. Token estimation uses a configurable `tokenCoefficient`.
 
 ### Build And Validation
 - No `package.json`, `Cargo.toml`, `pyproject.toml`, or `go.mod` is present in the repo root, so no repo-declared build/test commands were found.
-- Runtime validation is via OpenCode plugin execution and debug settings such as `debug`, `debugRequestPayload`, and `debugTokenCalc`.
+- Runtime validation is via OpenCode plugin execution and debug settings such as `logLevel` and `debugTokenCalc`.
 
 ### High-Risk Areas
 - `summarizedIDs` semantics in session state files.
@@ -40,7 +41,7 @@
 - Legacy summary migration into chunked summaries.
 
 ### Working Rules
-- `debug: false` must not produce file debug output.
+- `logLevel: none` must not produce file debug output.
 - `<system-reminder>...</system-reminder>` blocks are stripped before summarization.
 - Session summary chunks are retained with bounded per-session retention.
 - State and summary files are functional context artifacts, not disposable debug data.
