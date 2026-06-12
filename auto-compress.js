@@ -302,11 +302,7 @@ function findCutIndexByEstimatedTokens(messages, startIndex, targetRetainedToken
     return startIndex;
   }
 
-  const chosenMessage = messages[chosenIndex];
-  const parentIndex = chosenMessage?.info?.parentID
-    ? messages.findIndex((message) => message?.info?.id === chosenMessage.info.parentID)
-    : -1;
-  return parentIndex >= startIndex ? parentIndex : chosenIndex;
+  return chosenIndex;
 }
 
 /**
