@@ -1196,9 +1196,11 @@ export default async (_ctx, options = {}) => {
       const latestUsage = usageRecords.length > 0 ? usageRecords[usageRecords.length - 1] : null;
       const latestContextTokens = latestUsage?.contextTokens || 0;
 
+      // Provider context is the only trigger for compaction. Do not replace this with any local estimator.
       log(`[hook] providerContextTokens=${latestContextTokens}, maxContextTokens=${sanitizedMaxTokens}, effectiveMaxTokens=${effectiveMaxTokens}, hardMaxTokens=${hardMaxTokens}, minContextTokens=${sanitizedMinTokens}, hardMinTokens=${hardMinTokens}`);
       logTokenCalc(`[transform:reconstructed] providerContextTokens=${latestContextTokens} maxContextTokens=${sanitizedMaxTokens} effectiveMaxTokens=${effectiveMaxTokens} hardMaxTokens=${hardMaxTokens} minContextTokens=${sanitizedMinTokens} hardMinTokens=${hardMinTokens}`);
 
+      // If the provider says the session is still under the threshold, do not summarize.
       if (latestContextTokens < effectiveMaxTokens) {
         log("[hook] Below effectiveMaxTokens, returning reconstructed context.");
         return finalizeOutputWithReasoningStrip(output, stripReasoningOptions);
@@ -1226,6 +1228,8 @@ export default async (_ctx, options = {}) => {
           return getReasoningPartKey(startIndex + Number(messageIndexRaw), Number(partIndexRaw));
         }),
       );
+      // The cut point is still chosen by the software estimator: walk from newest to oldest until the retained tail reaches the minimum budget.
+      // Provider context decides whether to compact; the estimator decides where to cut.
       let cutIndex = findCutIndexByEstimatedTokens(
         messages,
         startIndex,
@@ -1365,6 +1369,7 @@ ${latestSummaryEntryText}
       const removedIndices = [];
       for (let i = startIndex; i < cutIndex; i++) removedIndices.push(i);
 
+      // This log reuses the last retained assistant context metadata; it is not a fresh provider measurement.
       log(`[hook] providerContextTokens=${afterLatestContextTokens}, maxContextTokens=${sanitizedMaxTokens}, effectiveMaxTokens=${effectiveMaxTokens}, hardMaxTokens=${hardMaxTokens}, minContextTokens=${sanitizedMinTokens}, hardMinTokens=${hardMinTokens}`);
       logTokenCalc(`[transform:final] providerContextTokens=${afterLatestContextTokens} maxContextTokens=${sanitizedMaxTokens} effectiveMaxTokens=${effectiveMaxTokens} hardMaxTokens=${hardMaxTokens} minContextTokens=${sanitizedMinTokens} hardMinTokens=${hardMinTokens}`);
 
