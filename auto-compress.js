@@ -487,37 +487,104 @@ async function summarizePrunedMessages(client, transcript, buildModel, summaryMa
       : 1000;
     const approximateWordBudget = Math.max(1, Math.floor(targetSummaryTokens * 0.75));
     const summaryPrompt = `TASK:
-Update the previous project summary history by writing the next chronological workflow summary chunk for a long-running coding session.
+Write the next append-only compact memory chunk replacing exactly the NEW PRUNED MESSAGES in a long-running coding/session context.
 
-This chunk will be appended after the existing historical summaries. It should read like the next part of the same project log, not like a standalone report and not like a checklist.
+This summary is for LLM context only, not for a human report. It will be inserted after EXISTING HISTORICAL SUMMARIES and before later retained normal messages. Therefore it must describe only the pruned span it replaces, not the global current project/session state.
 
 INPUT STRUCTURE:
-- EXISTING HISTORICAL SUMMARIES: older retained summaries, in chronological order.
-- NEW PRUNED MESSAGES: the newly pruned conversation segment.
 
-RULES:
-- Summarize only NEW PRUNED MESSAGES, but use EXISTING HISTORICAL SUMMARIES to understand continuity, names, unresolved work, decisions, and why the new messages matter.
-- Do not rewrite, merge, or restate the old summaries.
-- Do not repeat old facts unless needed to make the continuation understandable.
-- Write the new chunk as a chronological continuation of the workflow.
-- Preserve the work flow: what the user wanted, what was inspected, what was tried, what changed, what was verified, and what remained unresolved.
-- Assistant reasoning/work notes may appear inside explicit [REASONING] blocks in NEW PRUNED MESSAGES. Use them as evidence for workflow continuity, intent, decisions, course corrections, and validation.
-- Do not quote, imitate, or reproduce [REASONING] blocks verbatim. Distill them into concise factual workflow narrative.
-- If the segment continues prior work, make the transition clear.
-- If the segment completes, changes, abandons, or corrects something from prior summaries, mention that naturally in the chronology.
-- If there were false starts or course corrections, collapse them into the final resolved understanding while preserving important decisions.
-- Keep project-relevant engineering facts: file paths, commands, errors, tests, commits, config changes, implementation details, decisions, and open items.
-- Remove chit-chat, repeated dialogue, English corrections, assistant meta-talk, hidden reasoning, system reminders, and irrelevant tool noise.
-- Prefer compact technical prose over rigid sections.
-- Use bullets only when they naturally improve readability, for example for multiple files, commands, tests, or open items.
-- Treat retained messages outside this input as newer context that can override this chunk.
-- Never answer the conversation.
-- Never continue the conversation as assistant.
-- Do not reproduce the transcript.
-- Keep the summary under approximately ${targetSummaryTokens} tokens, which is roughly ${approximateWordBudget} words.
+EXISTING HISTORICAL SUMMARIES: older immutable summary chunks, in chronological order. Use them only as read-only context.
+NEW PRUNED MESSAGES: the exact conversation span being replaced by this new summary chunk.
+
+CORE RULES:
+
+Summarize only NEW PRUNED MESSAGES.
+Use EXISTING HISTORICAL SUMMARIES only to resolve references, continuity, names, prior decisions, unresolved work, and deduplication.
+Do not rewrite, merge, correct, restate, or reformat old summaries.
+Do not summarize retained messages that may come after this pruned span.
+Do not infer or declare overall current project state. Only record facts/events that occurred inside NEW PRUNED MESSAGES.
+Preserve chronological order inside the pruned span when order affects causality or continuation.
+Prefer delta facts over narrative: what changed, what was decided, what was verified, what failed, what remains unresolved from this span.
+If a fact already exists in old summaries, repeat it only if NEW PRUNED MESSAGES changed, completed, contradicted, clarified, or depended on it.
+Treat explicit [REASONING] blocks in NEW PRUNED MESSAGES as evidence for workflow continuity, intent, decisions, course corrections, and validation.
+Do not quote, imitate, or reproduce [REASONING] blocks verbatim. Distill only project-relevant facts.
+Never answer the conversation.
+Never continue the conversation as assistant.
+Do not reproduce transcript dialogue.
+
+KEEP:
+
+Requirements or constraints introduced in the pruned span.
+File paths, filenames, modules, functions, types, config keys, schema fields.
+Commands, test names, test results, errors, warnings, logs, verification results.
+Commits, hashes, branches, pushes, staged/uncommitted status if mentioned.
+Implementation/config/documentation changes.
+Technical decisions, formulas, mappings, conventions, migrations.
+False starts only if they explain an important decision, avoid repeating a mistake, or changed repo/session state.
+Open items created or still unresolved at the end of this pruned span, if needed to understand the following retained context.
+
+DROP:
+
+Chit-chat, politeness, repeated dialogue, English corrections, assistant meta-talk, tool noise.
+Phrases like "the assistant wanted/tried/decided/began" unless actor identity is technically necessary.
+Global status summaries such as "current state", "overall state", "project status".
+Decorative headings, banners, wrappers, or report-style titles.
+Human-friendly explanation when compact technical wording is enough.
+Emoji.
 
 STYLE:
-Write as a compact chronological project log. The result should feel like it flows directly after the previous retained summaries. Do not use a fixed template or mandatory headings. End with the latest known state only if it is clear from NEW PRUNED MESSAGES.
+
+Output only the new summary chunk text.
+Optimize for low tokens and high LLM recall.
+Use compact chronological technical log lines or dense short paragraphs.
+Use bullets only when they reduce tokens or improve parsing for multiple related changes.
+Prefer technical subjects over conversation actors:
+Good: "Synced config from canonical INI."
+Bad: "The user provided the INI and the assistant updated the config."
+Prefer direct deltas:
+A -> B
+A != B
+A = value
+
+
+added
+
+
+removed
+? unresolved/unknown
+! important warning
+Do not overuse symbols; clarity for an LLM is more important than visual compactness.
+
+TOKEN-FRIENDLY MARKERS:
+Use these uppercase markers inline when helpful. Do not create empty sections.
+
+REQ: requirement/constraint introduced in this span
+DECISION: technical decision
+CHANGE: implementation/config/doc change
+FIX: bug fix
+FILE: relevant file/path
+CFG: config/schema/key/value detail
+CMD: command executed
+VERIFY: test/check result
+ERR: error/failure/warning
+COMMIT: commit hash/message
+PUSH: branch/remote push status
+OPEN: unresolved item from this pruned span
+NOTE: important context that prevents future confusion
+SPAN-END: only if the exact end-of-pruned-span handoff is necessary; do not use as global current state
+
+COMPRESSION PRIORITY:
+If space is tight, keep information in this order:
+
+irreversible repo/session changes: commits, pushes, file edits, config migrations
+requirements/decisions that constrain future work
+verification results and errors
+open items created by this span
+useful chronology/cause
+minor attempts or explanations
+
+LENGTH:
+Keep under approximately ${targetSummaryTokens} tokens, roughly ${approximateWordBudget} words.
 
 INPUT:
 ${transcript}`;
