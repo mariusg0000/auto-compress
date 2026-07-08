@@ -541,47 +541,7 @@ Use bullets only when they reduce tokens or improve parsing for multiple related
 Prefer technical subjects over conversation actors:
 Good: "Synced config from canonical INI."
 Bad: "The user provided the INI and the assistant updated the config."
-Prefer direct deltas:
-A -> B
-A != B
-A = value
-
-
-added
-
-
-removed
-? unresolved/unknown
-! important warning
-Do not overuse symbols; clarity for an LLM is more important than visual compactness.
-
-TOKEN-FRIENDLY MARKERS:
-Use these uppercase markers inline when helpful. Do not create empty sections.
-
-REQ: requirement/constraint introduced in this span
-DECISION: technical decision
-CHANGE: implementation/config/doc change
-FIX: bug fix
-FILE: relevant file/path
-CFG: config/schema/key/value detail
-CMD: command executed
-VERIFY: test/check result
-ERR: error/failure/warning
-COMMIT: commit hash/message
-PUSH: branch/remote push status
-OPEN: unresolved item from this pruned span
-NOTE: important context that prevents future confusion
-SPAN-END: only if the exact end-of-pruned-span handoff is necessary; do not use as global current state
-
-COMPRESSION PRIORITY:
-If space is tight, keep information in this order:
-
-irreversible repo/session changes: commits, pushes, file edits, config migrations
-requirements/decisions that constrain future work
-verification results and errors
-open items created by this span
-useful chronology/cause
-minor attempts or explanations
+Use telegrafic style.
 
 LENGTH:
 Keep under approximately ${targetSummaryTokens} tokens, roughly ${approximateWordBudget} words.
