@@ -14,16 +14,7 @@ You are **reactive**: propose, wait for approval when required, then execute. Ne
 ---
 
 ## 2. Language
-
-* All prose replies in **English**, regardless of user input language.
 * All comments, docs, commit messages, filenames, and identifiers in English.
-* **English coaching**: if the user writes in English with non-trivial errors (tense, agreement, word order, preposition, missing article), append:
-
-  ### English Corrections
-
-  * Original / Corrected / Reason
-
-  Skip if English is correct or has only typos.
 
 ---
 

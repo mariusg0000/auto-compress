@@ -487,61 +487,65 @@ async function summarizePrunedMessages(client, transcript, buildModel, summaryMa
       : 1000;
     const approximateWordBudget = Math.max(1, Math.floor(targetSummaryTokens * 0.75));
     const summaryPrompt = `TASK:
-Write the next append-only compact memory chunk replacing exactly the NEW PRUNED MESSAGES in a long-running coding/session context.
+Write exactly one append-only technical memory chunk replacing the NEW PRUNED MESSAGES in a long-running coding/session context.
 
-This summary is for LLM context only, not for a human report. It will be inserted after EXISTING HISTORICAL SUMMARIES and before later retained normal messages. Therefore it must describe only the pruned span it replaces, not the global current project/session state.
+This is a memory compression task, not a conversation reply. Output only the new summary chunk text.
+The chunk will be inserted after EXISTING HISTORICAL SUMMARIES and before later retained normal messages. Describe only the pruned span it replaces, not global project or session state.
 
-INPUT STRUCTURE:
+=== EXISTING HISTORICAL SUMMARIES — REFERENCE ONLY ===
+These are older immutable summary chunks in chronological order.
+Use them only for continuity, references, names, deduplication, and understanding whether the new span changed, confirmed, contradicted, clarified, or depended on an older fact.
+Do not summarize, copy, rewrite, merge, correct, reformat, or include them in the output.
+Mention an older fact only when the NEW PRUNED MESSAGES explicitly change, confirm, contradict, clarify, or depend on it.
 
-EXISTING HISTORICAL SUMMARIES: older immutable summary chunks, in chronological order. Use them only as read-only context.
-NEW PRUNED MESSAGES: the exact conversation span being replaced by this new summary chunk.
+=== NEW PRUNED MESSAGES — ONLY CONTENT TO SUMMARIZE ===
+This is the exact conversation span replaced by the new chunk and the only source for the output.
 
-CORE RULES:
+CHRONOLOGICAL CONTENT:
+Record events in their actual order. Preserve, when present:
+- Requirement: user request, constraint, approval, rejection, or scope change.
+- Plan: goal, ordered steps, files, dependencies, risks, and validation.
+- Tasks: meaningful checklist items and their status: done, pending, blocked, or replaced.
+- Decision: chosen approach and reason.
+- Analysis result: completed diagnosis, finding, conclusion, verdict, recommendation, or answer to an investigated problem.
+- Implemented: file or identifier changed, behavior, and why.
+- Validation: commands, tests, results, errors, warnings, logs, or verification outcomes.
+- Status: unresolved item created or still open at the end of this span.
 
-Summarize only NEW PRUNED MESSAGES.
-Use EXISTING HISTORICAL SUMMARIES only to resolve references, continuity, names, prior decisions, unresolved work, and deduplication.
-Do not rewrite, merge, correct, restate, or reformat old summaries.
-Do not summarize retained messages that may come after this pruned span.
-Do not infer or declare overall current project state. Only record facts/events that occurred inside NEW PRUNED MESSAGES.
-Preserve chronological order inside the pruned span when order affects causality or continuation.
-Prefer delta facts over narrative: what changed, what was decided, what was verified, what failed, what remains unresolved from this span.
-If a fact already exists in old summaries, repeat it only if NEW PRUNED MESSAGES changed, completed, contradicted, clarified, or depended on it.
-Treat explicit [REASONING] blocks in NEW PRUNED MESSAGES as evidence for workflow continuity, intent, decisions, course corrections, and validation.
-Do not quote, imitate, or reproduce [REASONING] blocks verbatim. Distill only project-relevant facts.
-Never answer the conversation.
-Never continue the conversation as assistant.
-Do not reproduce transcript dialogue.
+IMPLEMENTATION PLANS:
+If the NEW PRUNED MESSAGES contain an implementation plan, preserve it as a first-class memory item.
+Keep its goal, ordered steps, subtasks, files, paths, modules, functions, types, schema fields, config keys, constraints, assumptions, dependencies, validation plan, risks, open questions, and explicit approval, rejection, modification, or supersession.
+Compress wording and duplication, but do not collapse the plan into a vague summary.
+Do not present planned work as completed, approved scope, or current project state unless the span explicitly says so.
+
+ANALYSIS OUTCOMES - MANDATORY:
+If the span contains a completed analysis, diagnosis, finding, conclusion, verdict, recommendation, or answer to an investigated problem, preserve it as an Analysis result item.
+Keep confirmed, rejected, and unresolved status; scope, conditions, exceptions, important uncertainty, supporting files or evidence, and the practical consequence or next action when stated.
+Record the final result, not only the investigation process.
+Never promote a hypothesis, proposal, or open question into a confirmed conclusion.
 
 KEEP:
-
-Requirements or constraints introduced in the pruned span.
-File paths, filenames, modules, functions, types, config keys, schema fields.
-Commands, test names, test results, errors, warnings, logs, verification results.
-Commits, hashes, branches, pushes, staged/uncommitted status if mentioned.
-Implementation/config/documentation changes.
-Technical decisions, formulas, mappings, conventions, migrations.
-False starts only if they explain an important decision, avoid repeating a mistake, or changed repo/session state.
-Open items created or still unresolved at the end of this pruned span, if needed to understand the following retained context.
+Preserve technical deltas and continuation-critical facts:
+- requirements and constraints introduced in the pruned span
+- files, paths, modules, functions, types, config keys, and schema fields
+- commands, tests, test results, errors, warnings, logs, and verification results
+- commits, hashes, branches, pushes, and staged or uncommitted status when mentioned
+- implementation, configuration, documentation, dependency, migration, or schema changes
+- technical decisions, formulas, mappings, conventions, protocols, and workflows
+- failed attempts only when they explain a decision, prevent repeating a mistake, or changed repository/session state
+- open items created or still unresolved at the end of the span
 
 DROP:
+Do not reproduce source code, diffs, prompt templates, tool arguments, long quoted passages, transcript dialogue, reasoning, tool noise, assistant meta-talk, filler, or emoji.
+Do not copy prompt contents when the discussion is about a prompt; record its purpose, decision, change, or observed behavior instead.
+Do not summarize later retained messages or infer unsupported conclusions about content outside NEW PRUNED MESSAGES.
 
-Chit-chat, politeness, repeated dialogue, English corrections, assistant meta-talk, tool noise.
-Phrases like "the assistant wanted/tried/decided/began" unless actor identity is technically necessary.
-Global status summaries such as "current state", "overall state", "project status".
-Decorative headings, banners, wrappers, or report-style titles.
-Human-friendly explanation when compact technical wording is enough.
-Emoji.
+[REASONING] blocks may support an action, decision, failure, validation, or open item, but must never be quoted or reproduced. Distill only project-relevant facts and do not preserve speculation unless it affected a decision, action, validation result, or open item.
 
 STYLE:
-
-Output only the new summary chunk text.
-Optimize for low tokens and high LLM recall.
-Use compact chronological technical log lines or dense short paragraphs.
-Use bullets only when they reduce tokens or improve parsing for multiple related changes.
-Prefer technical subjects over conversation actors:
-Good: "Synced config from canonical INI."
-Bad: "The user provided the INI and the assistant updated the config."
-Use telegrafic style.
+Use compact chronological technical bullets or dense short paragraphs. Prefer the labels Requirement:, Plan:, Tasks:, Decision:, Analysis result:, Implemented:, Validation:, and Status: when useful.
+Preserve exact identifiers, short protocol literals, paths, commands, hashes, and errors only when needed for continuation.
+Optimize for low tokens and high recall. Do not answer the conversation or continue it as an assistant.
 
 LENGTH:
 Keep under approximately ${targetSummaryTokens} tokens, roughly ${approximateWordBudget} words.
