@@ -1,0 +1,12 @@
+COMPLETED: Create v2/ directory structure
+COMPLETED: Write v2/package.json for dependencies
+COMPLETED: Write v2/auto-compress.js plugin entry (Plugin.define + setup)
+COMPLETED: Implement token estimation utility (ported from V1)
+COMPLETED: Implement reasoning stripping (request hook core)
+COMPLETED: Implement summary state persistence (disk-based, ported from V1)
+COMPLETED: Implement summarization via temp session + event subscription
+COMPLETED: Implement request hook (compaction decision + message manipulation)
+COMPLETED: Validate with type checker / syntax check
+COMPLETED: Update AGENTS.md with V2 instructions
+COMPLETED: Update README.md with V2 references
+COMPLETED: Write v2/README.md with install/options docs

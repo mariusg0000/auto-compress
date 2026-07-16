@@ -434,3 +434,23 @@ Do not continue implementation, create new todos, stage additional files, make a
 
 Any future implementation requires a new explicit `proceed`, `go`, or `begin`.
 
+---
+
+## Project Structure — V2 Plugin
+
+This project has both V1 and V2 versions of the auto-compress plugin:
+
+| Path | Version | API |
+|------|---------|-----|
+| `auto-compress.js` | V1 | `export default async (ctx, options)` with `experimental.chat.messages.transform` |
+| `v2/auto-compress.js` | V2 | `Plugin.define({ id, setup })` from `@opencode-ai/plugin/v2` |
+
+### V2 plugin notes
+
+- Entry point: `v2/auto-compress.js` (ESM)
+- Dependencies: `@opencode-ai/plugin@next` (install via `cd v2 && bun install`)
+- Hook: `ctx.session.hook("request", (event) => { event.messages; event.system; event.tools })`
+- Runs before model dispatch (modifies the request in-place)
+- No `@opencode-ai/sdk` dependency (V2 provides `ctx.session.create`, `ctx.session.prompt`, `ctx.event.subscribe`)
+- Same disk state directory: `~/.config/opencode/logs/auto-compress/`
+

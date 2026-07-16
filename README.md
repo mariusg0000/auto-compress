@@ -49,6 +49,18 @@ Add to `~/.config/opencode/opencode.json`:
 
 If you enable integrated `stripReasoning`, remove the separate `strip-reasoning` plugin from the same OpenCode config.
 
+---
+
+## V2 Plugin
+
+An OpenCode V2 port is available in `v2/`. See [v2/README.md](v2/README.md) for installation and options.
+
+**Key differences:**
+- Uses `Plugin.define({ id, setup })` from `@opencode-ai/plugin/v2`
+- Hooks `ctx.session.hook("request")` instead of `experimental.chat.messages.transform`
+- Run `cd v2 && bun install` to install the plugin dependency
+- Place in `~/.config/opencode/plugins/` for auto-discovery, or add a config entry
+
 ### Configuration
 
 | Option                           | Type    | Default | Practical Effect                                                                    |
