@@ -51,16 +51,6 @@ If you enable integrated `stripReasoning`, remove the separate `strip-reasoning`
 
 ---
 
-## V2 Plugin
-
-An OpenCode V2 port is available in `v2/`. See [v2/README.md](v2/README.md) for installation and options.
-
-**Key differences:**
-- Uses `Plugin.define({ id, setup })` from `@opencode-ai/plugin/v2`
-- Hooks `ctx.session.hook("request")` instead of `experimental.chat.messages.transform`
-- Run `cd v2 && bun install` to install the plugin dependency
-- Place in `~/.config/opencode/plugins/` for auto-discovery, or add a config entry
-
 ### Configuration
 
 | Option                           | Type    | Default | Practical Effect                                                                    |
@@ -134,17 +124,33 @@ Cons:
 4. If provider-reported context is below the current `effectiveMaxTokens`, return reconstructed messages after optional reasoning strip.
 5. If provider-reported context reaches threshold, compute prune cut with the local estimator so only about `minContextTokens` of newest retained content remains, or `hardMinTokens` when already above the hard cap.
 6. Extend cut when needed to avoid splitting tool-use/result semantics.
-8. Build transcript from pruned messages:
-    - include text parts,
-    - include only the newest configured reasoning parts as `[REASONING]` blocks,
-    - include compact tool title/output/error text,
-    - remove `<system-reminder>...</system-reminder>` blocks,
-    - skip empty lines/messages.
-9. Load the retained per-session summary chunks for historical continuity.
-10. Summarize the newly pruned segment using temporary session and `promptAsync` with `agent: "compaction"`.
-11. Save the new summary as `summaries/<sessionID>/<sequence>.md`, then trim older chunks beyond `maxSummaryFiles`.
-12. Save updated `summarizedIDs` in state.
-13. Return final message list with one synthetic summary bundle prepended.
+7. Build transcript from pruned messages:
+     - include text parts,
+     - include only the newest configured reasoning parts as `[REASONING]` blocks,
+     - remove `<system-reminder>...</system-reminder>` blocks,
+     - skip empty lines/messages.
+8. Load the retained per-session summary chunks for historical continuity.
+9. Summarize the newly pruned segment using a temporary session and `promptAsync` with `agent: "compaction"`.
+10. Save the new summary as `summaries/<sessionID>/<sequence>.md`, then trim older chunks beyond `maxSummaryFiles`.
+11. Save updated `summarizedIDs` in state.
+12. Return the final message list with one synthetic summary bundle prepended.
+
+### Summary Prompt Contract
+
+The summarizer receives the existing historical chunks as reference and the newly pruned messages as the only content to summarize. It must produce one append-only technical memory chunk for the pruned span, not a conversation reply or a rewritten global summary.
+
+When present, the prompt preserves these items as compact chronological facts:
+
+- `Requirement`: requests, constraints, approvals, rejections, and scope changes.
+- `Plan`: implementation goals, steps, files, risks, and validation plans.
+- `Tasks`: meaningful task status, including done, pending, blocked, or replaced.
+- `Decision`: selected approaches and their reasons.
+- `Analysis result`: confirmed findings, diagnoses, conclusions, recommendations, and unresolved conditions.
+- `Implemented`: files, identifiers, behavior changes, and reasons.
+- `Validation`: commands, tests, results, errors, warnings, and logs.
+- `Status`: unresolved work at the end of the pruned span.
+
+The generated chunk is constrained by `summaryMaxTokens` and is retained chronologically with the other per-session chunks.
 
 ### State And Files
 
@@ -153,6 +159,7 @@ Cons:
 | `~/.config/opencode/logs/auto-compress/state/<sessionID>.json`             | Persistent functional state (`summarizedIDs`, failure state, legacy migration slot) |
 | `~/.config/opencode/logs/auto-compress/summaries/<sessionID>/<NNNNNN>.md`  | Retained per-session summary chunks in chronological order |
 | `~/.config/opencode/logs/auto-compress/auto-compress.log`                  | Debug log when `logLevel: debug`                         |
+| `~/.config/opencode/logs/auto-compress/token-calc.log`                     | Token estimator trace when `logLevel: debug` and `debugTokenCalc: true` |
 | `~/.config/opencode/logs/auto-compress/prune-<sessionID>-<timestamp>.json` | Per-prune debug snapshots when `logLevel: debug`         |
 
 Retention policy:
@@ -164,7 +171,7 @@ Retention policy:
 - `state/*.json` is functional state, not disposable debug data.
 - `summaries/<sessionID>/*.md` is functional retained context, not disposable debug data.
 - `logLevel: none` must produce no file logging/debug snapshots.
-- Summarization uses the configured `model` when provided, otherwise the active session model.
+- Summarization uses the configured `model` when provided, otherwise the latest model found in session history; if none is available, it falls back to the Build model from `~/.config/opencode/opencode.json` or `opencode-go/deepseek-v4-flash`.
 - Transcript must strip `<system-reminder>` blocks before summarization.
 - Provider-reported context tokens remain the only trigger for compaction thresholds and hard caps.
 - When `stripReasoning.enable: true`, reasoning strip is applied only at final payload return and inside summary transcript construction.
@@ -193,4 +200,4 @@ Retention policy:
 
 ## Version
 
-Last modified: 2026-06-12
+Last modified: 2026-07-16
